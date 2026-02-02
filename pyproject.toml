@@ -1,0 +1,70 @@
+[project]
+name = "agenthub"
+version = "0.1.0"
+description = "Lightweight agent orchestration for context-efficient LLM applications"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "John"}
+]
+keywords = ["ai", "agents", "llm", "orchestration", "anthropic", "claude"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=0.40.0",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "python-dotenv>=1.0",
+]
+
+[project.scripts]
+agenthub = "agenthub.cli:main"
+
+[project.optional-dependencies]
+db = ["psycopg2-binary>=2.9"]
+dashboard = [
+    "fastapi>=0.100.0",
+    "uvicorn>=0.23.0",
+]
+watch = ["watchdog>=3.0"]
+openai = ["openai>=1.0"]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=4.0",
+    "ruff>=0.5",
+    "mypy>=1.0",
+]
+all = ["agenthub[db,dashboard,watch,openai]"]
+
+[project.urls]
+Homepage = "https://github.com/white-dots/agent_hub"
+Repository = "https://github.com/white-dots/agent_hub"
+Issues = "https://github.com/white-dots/agent_hub/issues"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agenthub"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+select = ["E", "F", "I", "N", "W"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--cov=agenthub --cov-report=term-missing"
