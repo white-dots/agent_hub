@@ -11,10 +11,14 @@ if TYPE_CHECKING:
     import anthropic
 
     from agenthub.agents.base import BaseAgent
+    from agenthub.auto.cross_context import CrossAgentContextManager, CrossContextConfig
+    from agenthub.auto.import_graph import ImportGraph
+    from agenthub.auto.manager import AutoAgentManager
     from agenthub.cache import FileWatcher, GitAwareCache, WatchConfig
     from agenthub.qc.models import ChangeSet, Concern, ConcernReport
     from agenthub.qc.pipeline import ChangeAnalysisPipeline
     from agenthub.qc.qc_agent import QCAgent
+    from agenthub.teams.executor import DAGTeamExecutor
 
 
 class AgentHub:
@@ -68,6 +72,15 @@ class AgentHub:
         self._analysis_pipeline: Optional["ChangeAnalysisPipeline"] = None
         self._on_concern_raised: Optional[Callable[["Concern"], None]] = None
         self._on_qc_report: Optional[Callable[["ConcernReport"], None]] = None
+
+        # For cross-agent context sharing
+        self._cross_context_manager: Optional["CrossAgentContextManager"] = None
+        self._cross_context_enabled: bool = False
+
+        # For DAG team execution
+        self._team_executor: Optional["DAGTeamExecutor"] = None
+        self._complexity_threshold: float = 0.4
+        self._import_graph: Optional["ImportGraph"] = None  # Set by discover_all_agents
 
     # ==================== Agent Registration ====================
 
@@ -242,6 +255,7 @@ class AgentHub:
         session_id: Optional[str] = None,
         agent_id: Optional[str] = None,
         model: Optional[str] = None,
+        team_mode: str = "auto",
     ) -> AgentResponse:
         """Execute a query through the hub.
 
@@ -253,6 +267,10 @@ class AgentHub:
             session_id: Existing session ID (creates new if None).
             agent_id: Force specific agent (auto-routes if None).
             model: Override model for this call.
+            team_mode: Controls DAG team execution.
+                "auto" - use ComplexityClassifier to decide (default)
+                "always" - always use DAG team (useful for testing)
+                "never" - never use DAG team (original behavior)
 
         Returns:
             AgentResponse with content and metadata.
@@ -268,7 +286,27 @@ class AgentHub:
         else:
             session = self.create_session()
 
-        # Route to agent
+        # Add user message to session
+        session.messages.append(Message(role="user", content=query))
+        session.updated_at = datetime.now()
+
+        # Check for team execution if not forcing specific agent
+        if agent_id is None and team_mode != "never" and self._team_executor:
+            from agenthub.teams.classifier import ComplexityClassifier
+
+            classifier = ComplexityClassifier(self, threshold=self._complexity_threshold)
+            result = classifier.classify(query)
+
+            if result.is_complex or team_mode == "always":
+                response = self._team_executor.execute(
+                    query=query,
+                    matched_agents=result.matched_agents,
+                    session=session,
+                )
+                session.total_tokens_used += response.tokens_used
+                return response
+
+        # Route to agent (single agent path)
         target_agent_id = agent_id or self.route(query)
 
         if target_agent_id not in self._agents:
@@ -276,13 +314,23 @@ class AgentHub:
 
         agent = self._agents[target_agent_id]
 
+        # Get cross-agent context if enabled
+        injected_context = ""
+        if self._cross_context_enabled and self._cross_context_manager:
+            from agenthub.auto.cross_context import format_injected_context
+
+            related = self._cross_context_manager.get_related_context(
+                agent_id=target_agent_id,
+                query=query,
+            )
+            if related:
+                injected_context = format_injected_context(related)
+
         # Update session
         session.agent_id = target_agent_id
-        session.messages.append(Message(role="user", content=query))
-        session.updated_at = datetime.now()
 
-        # Execute
-        response = agent.run(query, session, model=model)
+        # Execute with optional cross-agent context
+        response = agent.run(query, session, model=model, injected_context=injected_context)
 
         # Store response in session
         session.messages.append(
@@ -615,10 +663,148 @@ class AgentHub:
         """Check if QC analysis is enabled."""
         return self._analysis_pipeline is not None
 
+    # ==================== Cross-Agent Context Sharing ====================
+
+    def enable_cross_context(
+        self,
+        config: Optional["CrossContextConfig"] = None,
+    ) -> "CrossAgentContextManager":
+        """Enable cross-agent context injection.
+
+        When enabled, queries will automatically receive relevant context
+        from other agents whose code is imported by the queried agent's domain.
+
+        This helps agents provide more accurate responses when dealing with
+        code that depends on modules from other agents' domains.
+
+        Args:
+            config: Optional configuration for context injection.
+                    Defaults to CrossContextConfig() with sensible defaults.
+
+        Returns:
+            CrossAgentContextManager instance for manual control.
+
+        Example:
+            >>> hub.enable_auto_agents("./project")
+            >>> hub.enable_cross_context()
+            >>> # Now queries automatically get related context
+            >>> response = hub.run("How does auth work?")
+
+            # With custom config:
+            >>> from agenthub.auto.cross_context import CrossContextConfig
+            >>> hub.enable_cross_context(CrossContextConfig(
+            ...     max_injected_chars=5000,
+            ...     max_agents_to_inject=2,
+            ... ))
+        """
+        from agenthub.auto.cross_context import CrossAgentContextManager, CrossContextConfig
+
+        # Get import graph from auto manager if available
+        import_graph = None
+        if self._auto_manager:
+            import_graph = getattr(self._auto_manager, "_import_graph", None)
+
+        self._cross_context_manager = CrossAgentContextManager(
+            hub=self,
+            import_graph=import_graph,
+            config=config or CrossContextConfig(),
+        )
+        self._cross_context_enabled = True
+
+        return self._cross_context_manager
+
+    def disable_cross_context(self) -> None:
+        """Disable cross-agent context injection."""
+        self._cross_context_enabled = False
+
+    @property
+    def is_cross_context_enabled(self) -> bool:
+        """Check if cross-agent context sharing is enabled."""
+        return self._cross_context_enabled
+
+    # ==================== DAG Team Execution ====================
+
+    def enable_teams(
+        self,
+        import_graph: Optional["ImportGraph"] = None,
+        max_parallel: int = 4,
+        complexity_threshold: float = 0.4,
+    ) -> "DAGTeamExecutor":
+        """Enable DAG team execution for complex queries.
+
+        When enabled, complex queries that span multiple agent domains
+        will be handled by a team of agents working together in
+        dependency order derived from the import graph.
+
+        Args:
+            import_graph: ImportGraph instance. If None, will be obtained
+                         from the auto-agent manager's project analysis.
+            max_parallel: Max agents to run in parallel per layer.
+            complexity_threshold: Score threshold for triggering teams.
+                                 Lower values = more queries go to DAG teams.
+
+        Returns:
+            DAGTeamExecutor instance for direct use if needed.
+
+        Raises:
+            ValueError: If no import graph available (auto-agents not enabled
+                       and no graph provided).
+
+        Example:
+            >>> hub = AgentHub()
+            >>> hub.enable_auto_agents("./my-project")
+            >>> hub.enable_teams()
+            >>>
+            >>> # Simple queries go to single agent
+            >>> hub.run("What does parse_config do?")
+            >>>
+            >>> # Complex queries use team execution
+            >>> hub.run("How does data flow from API to database?")
+            >>>
+            >>> # Force team mode for testing
+            >>> hub.run("Explain auth", team_mode="always")
+        """
+        from agenthub.teams.executor import DAGTeamExecutor
+
+        # Try to get import graph from multiple sources if not provided
+        if import_graph is None:
+            # First try the hub's own _import_graph (set by discover_all_agents)
+            if self._import_graph is not None:
+                import_graph = self._import_graph
+            # Then try auto manager
+            elif self._auto_manager:
+                import_graph = getattr(self._auto_manager, "_import_graph", None)
+
+        if import_graph is None:
+            raise ValueError(
+                "No import graph available. Either provide one or "
+                "enable auto-agents first with enable_auto_agents() or discover_all_agents()."
+            )
+
+        self._team_executor = DAGTeamExecutor(
+            hub=self,
+            import_graph=import_graph,
+            max_parallel=max_parallel,
+        )
+        self._complexity_threshold = complexity_threshold
+
+        return self._team_executor
+
+    def disable_teams(self) -> None:
+        """Disable DAG team execution."""
+        self._team_executor = None
+
+    @property
+    def is_teams_enabled(self) -> bool:
+        """Check if DAG team execution is enabled."""
+        return self._team_executor is not None
+
     def __repr__(self) -> str:
         watching = " watching" if self.is_watching else ""
         qc = " qc" if self.is_qc_enabled else ""
-        return f"<AgentHub agents={len(self._agents)} sessions={len(self._sessions)}{watching}{qc}>"
+        cross = " cross-context" if self.is_cross_context_enabled else ""
+        teams = " teams" if self.is_teams_enabled else ""
+        return f"<AgentHub agents={len(self._agents)} sessions={len(self._sessions)}{watching}{qc}{cross}{teams}>"
 
 
 # Type hint for auto-agent config (avoid circular import)

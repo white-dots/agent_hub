@@ -483,6 +483,8 @@ Reference specific code in your answers.""",
             str(self.project_root),
             ignore_patterns=self.config.ignore_patterns,
         )
+        # Store import graph for later access (e.g., by enable_teams())
+        self._import_graph: ImportGraph | None = None
 
     def create_agents(self) -> list[BaseAgent]:
         """Analyze codebase and create specialized agents.
@@ -509,6 +511,9 @@ Reference specific code in your answers.""",
             ignore_patterns=self.config.ignore_patterns,
         )
         import_graph.build()
+
+        # Store for later access (e.g., by enable_teams())
+        self._import_graph = import_graph
 
         # Analyze domains
         domain_analysis = DomainAnalysis(

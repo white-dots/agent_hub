@@ -141,6 +141,15 @@ def get_hub():
     try:
         from agenthub.auto import discover_all_agents
         _hub, summary = discover_all_agents(_project_root)
+
+        # Enable team execution if import graph is available
+        if _hub._import_graph is not None:
+            try:
+                _hub.enable_teams()
+                print("DAG team execution enabled", file=sys.stderr)
+            except Exception as e:
+                print(f"Warning: Could not enable teams: {e}", file=sys.stderr)
+
         # Log to stderr (won't interfere with MCP protocol on stdout)
         print(f"AgentHub initialized for: {_project_root}", file=sys.stderr)
         print(summary, file=sys.stderr)
@@ -165,6 +174,9 @@ The query will be automatically routed to the best agent based on keywords:
 - Configuration questions -> Config Expert
 - Test questions -> Test Expert
 
+For complex cross-cutting queries (e.g., "How does data flow from API to database?"),
+AgentHub can use team execution with multiple agents working together.
+
 Use this for codebase-specific questions that benefit from specialized knowledge.""",
         "inputSchema": {
             "type": "object",
@@ -176,6 +188,11 @@ Use this for codebase-specific questions that benefit from specialized knowledge
                 "agent_id": {
                     "type": "string",
                     "description": "Optional: specific agent ID to use (bypasses auto-routing)"
+                },
+                "team_mode": {
+                    "type": "string",
+                    "enum": ["auto", "always", "never"],
+                    "description": "Team execution mode: 'auto' (let AgentHub decide), 'always' (force team), 'never' (force single agent). Default: 'auto'"
                 }
             },
             "required": ["question"]
@@ -230,16 +247,23 @@ Example MCP config:
     if name == "agenthub_query":
         question = arguments.get("question", "")
         agent_id = arguments.get("agent_id")
+        team_mode = arguments.get("team_mode", "auto")
 
         # Broadcast query to dashboard
         broadcast_to_dashboard(
             "task",
             f"Claude Code query: {question[:100]}{'...' if len(question) > 100 else ''}",
-            {"query": question, "requested_agent": agent_id},
+            {"query": question, "requested_agent": agent_id, "team_mode": team_mode},
         )
 
         try:
-            response = hub.run(question, agent_id=agent_id)
+            response = hub.run(question, agent_id=agent_id, team_mode=team_mode)
+
+            # Build response info
+            team_info = ""
+            if response.metadata.get("team_execution"):
+                agents_used = response.metadata.get("agents_used", [])
+                team_info = f"\nTeam execution: {len(agents_used)} agents used ({', '.join(agents_used)})"
 
             # Broadcast result to dashboard (full content)
             broadcast_to_dashboard(
@@ -250,11 +274,12 @@ Example MCP config:
                     "tokens_used": response.tokens_used,
                     "query": question,
                     "response": response.content,
+                    "team_execution": response.metadata.get("team_execution", False),
                 },
             )
 
             return f"""Agent: {response.agent_id}
-Tokens used: {response.tokens_used}
+Tokens used: {response.tokens_used}{team_info}
 
 Response:
 {response.content}"""

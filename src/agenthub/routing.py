@@ -54,13 +54,32 @@ class KeywordRouter:
         Returns:
             Agent ID of best match, or None if no match.
         """
+        scores = self.get_all_scores(query, agents)
+        if scores:
+            # Return agent with highest score
+            best = max(scores.items(), key=lambda x: x[1])
+            if best[1] > 0:
+                return best[0]
+        return None
+
+    def get_all_scores(self, query: str, agents: list[AgentSpec]) -> dict[str, int]:
+        """Get keyword match scores for ALL agents.
+
+        This is useful for determining how many agents are relevant to a query,
+        which helps decide whether to use single-agent or multi-agent execution.
+
+        Args:
+            query: The user's query.
+            agents: List of available agent specs.
+
+        Returns:
+            Dict mapping agent_id -> score (0 if no match).
+        """
         if not agents:
-            return None
+            return {}
 
         query_text = query if self.case_sensitive else query.lower()
-
-        # Score each agent by keyword matches
-        scores: list[tuple[str, int]] = []
+        scores: dict[str, int] = {}
 
         for agent in agents:
             score = 0
@@ -72,15 +91,9 @@ class KeywordRouter:
                     if f" {keyword_text} " in f" {query_text} ":
                         score += 1
 
-            if score > 0:
-                scores.append((agent.agent_id, score))
+            scores[agent.agent_id] = score
 
-        if scores:
-            # Return agent with highest score
-            scores.sort(key=lambda x: x[1], reverse=True)
-            return scores[0][0]
-
-        return None
+        return scores
 
 
 class TierAwareRouter:

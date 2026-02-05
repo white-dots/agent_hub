@@ -34,6 +34,12 @@ from agenthub.auto.smart_factory import SmartAgentFactory, SmartCodeAgent
 from agenthub.auto.import_graph import ImportGraph, ImportEdge, ModuleNode
 from agenthub.auto.domain_analysis import Domain, DomainAnalysis
 from agenthub.auto.dynamic_rnr import DynamicRnR, DynamicRnRGenerator
+from agenthub.auto.cross_context import (
+    CrossAgentContextManager,
+    CrossContextConfig,
+    InjectedContext,
+    format_injected_context,
+)
 from agenthub.auto.tier_a_discovery import (
     TierADiscovery,
     DiscoveredAgent,
@@ -148,6 +154,11 @@ def discover_all_agents(
                 tier_b_count += 1
             except ValueError:
                 pass  # Already registered
+
+        # Store import graph on hub for team execution support
+        # The import graph is built during create_agents() with dynamic domains
+        if factory._import_graph is not None:
+            hub._import_graph = factory._import_graph
 
         summary_parts.append(f"\nTier B agents created: {tier_b_count}")
 
@@ -309,4 +320,9 @@ __all__ = [
     # Basic factory
     "AutoAgentFactory",
     "AutoCodeAgent",
+    # Cross-agent context sharing
+    "CrossAgentContextManager",
+    "CrossContextConfig",
+    "InjectedContext",
+    "format_injected_context",
 ]

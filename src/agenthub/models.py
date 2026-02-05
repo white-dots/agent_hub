@@ -82,6 +82,55 @@ class Artifact(BaseModel):
     description: str = ""
 
 
+class TeamExecutionTrace(BaseModel):
+    """Trace of a DAG team execution for observability."""
+
+    dag_structure: dict[str, list[str]] = Field(
+        default_factory=dict,
+        description="agent_id -> list of dependency agent_ids",
+    )
+    execution_layers: list[list[str]] = Field(
+        default_factory=list,
+        description="Topological execution order - each layer runs in parallel",
+    )
+    sub_questions: dict[str, str] = Field(
+        default_factory=dict,
+        description="agent_id -> sub-question assigned to that agent",
+    )
+    agent_responses: dict[str, str] = Field(
+        default_factory=dict,
+        description="agent_id -> response content",
+    )
+    agent_tokens: dict[str, int] = Field(
+        default_factory=dict,
+        description="agent_id -> tokens used",
+    )
+    agent_times: dict[str, int] = Field(
+        default_factory=dict,
+        description="agent_id -> execution time in ms",
+    )
+    decomposition_tokens: int = Field(
+        default=0,
+        description="Tokens used for query decomposition",
+    )
+    synthesis_tokens: int = Field(
+        default=0,
+        description="Tokens used for response synthesis",
+    )
+    total_tokens: int = Field(
+        default=0,
+        description="Total tokens across all operations",
+    )
+    total_time_ms: int = Field(
+        default=0,
+        description="Total wall-clock time in milliseconds",
+    )
+    parallel_speedup: float = Field(
+        default=1.0,
+        description="Speedup from parallel execution (sequential_time / actual_time)",
+    )
+
+
 class AgentResponse(BaseModel):
     """Standardized agent response."""
 
@@ -92,3 +141,7 @@ class AgentResponse(BaseModel):
     artifacts: list[Artifact] = Field(default_factory=list)
     needs_followup: bool = False
     suggested_agent: Optional[str] = None  # For agent handoff
+    metadata: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Additional metadata (e.g., team_execution trace)",
+    )
