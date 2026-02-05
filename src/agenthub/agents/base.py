@@ -134,6 +134,7 @@ class BaseAgent(ABC):
         query: str,
         session: Session,
         model: Optional[str] = None,
+        injected_context: str = "",
     ) -> AgentResponse:
         """Execute the agent on a query.
 
@@ -141,6 +142,7 @@ class BaseAgent(ABC):
             query: User's query to process.
             session: Current conversation session.
             model: Optional model override.
+            injected_context: Optional context from related agents (cross-agent sharing).
 
         Returns:
             AgentResponse with content and metadata.
@@ -152,7 +154,7 @@ class BaseAgent(ABC):
         response = self.client.messages.create(
             model=model or "claude-sonnet-4-20250514",
             max_tokens=4096,
-            system=self._build_system_prompt(),
+            system=self._build_system_prompt(injected_context),
             messages=messages,
             temperature=self.spec.temperature,
         )
@@ -169,8 +171,11 @@ class BaseAgent(ABC):
             artifacts=self._extract_artifacts(content),
         )
 
-    def _build_system_prompt(self) -> str:
+    def _build_system_prompt(self, injected_context: str = "") -> str:
         """Combine spec prompt with context.
+
+        Args:
+            injected_context: Optional context from related agents.
 
         Returns:
             Complete system prompt for the agent.
@@ -178,19 +183,26 @@ class BaseAgent(ABC):
         context = self.get_context()
         base_prompt = self.spec.system_prompt or f"You are {self.spec.name}. {self.spec.description}"
 
-        return f"""{base_prompt}
+        prompt = f"""{base_prompt}
 
 ## Your Specialized Context
 
 {context}
+"""
+        # Add cross-agent context if provided
+        if injected_context:
+            prompt += f"""
+{injected_context}
+"""
 
-## Instructions
+        prompt += """## Instructions
 
 - Focus only on your domain of expertise
 - If a query is outside your scope, say so clearly
 - Reference the context above when answering
 - Be concise but thorough
 """
+        return prompt
 
     def _build_messages(self, query: str, session: Session) -> list[dict[str, str]]:
         """Build message list from session history + new query.

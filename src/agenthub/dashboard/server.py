@@ -554,6 +554,93 @@ def create_dashboard_app(hub, observer: Optional[ConversationObserver] = None):
         except Exception as e:
             return {"error": str(e)}
 
+    @app.get("/api/files")
+    async def list_project_files(extensions: str = ".py", max_files: int = 500):
+        """List project files for QC analysis selection.
+
+        Args:
+            extensions: Comma-separated file extensions to include (default: ".py")
+            max_files: Maximum number of files to return (default: 500)
+
+        Returns:
+            List of files organized by directory.
+        """
+        from pathlib import Path
+
+        # Get project root from auto manager or first agent's context paths
+        project_root = None
+
+        if hasattr(_hub, "_auto_manager") and _hub._auto_manager:
+            project_root = getattr(_hub._auto_manager, "_project_root", None)
+
+        if not project_root:
+            # Try to infer from agent context paths
+            for spec in _hub.list_agents():
+                if spec.context_paths:
+                    first_path = spec.context_paths[0]
+                    # Walk up to find project root
+                    path = Path(first_path)
+                    if path.is_absolute():
+                        project_root = str(path.parent.parent)
+                    break
+
+        if not project_root:
+            return {"files": [], "error": "Could not determine project root"}
+
+        root = Path(project_root)
+        if not root.exists():
+            return {"files": [], "error": f"Project root not found: {project_root}"}
+
+        # Parse extensions
+        ext_list = [e.strip() for e in extensions.split(",")]
+        ext_list = [e if e.startswith(".") else f".{e}" for e in ext_list]
+
+        # Directories to ignore
+        ignore_dirs = {
+            "__pycache__", ".git", ".venv", "venv", "node_modules",
+            ".egg-info", "build", "dist", ".pytest_cache", ".mypy_cache",
+        }
+
+        files_by_dir: dict = {}
+        file_count = 0
+
+        for ext in ext_list:
+            for file_path in root.rglob(f"*{ext}"):
+                if file_count >= max_files:
+                    break
+
+                # Skip ignored directories
+                if any(part in ignore_dirs or part.startswith(".") for part in file_path.parts):
+                    continue
+
+                rel_path = str(file_path.relative_to(root))
+                dir_path = str(file_path.parent.relative_to(root)) or "."
+
+                if dir_path not in files_by_dir:
+                    files_by_dir[dir_path] = []
+
+                files_by_dir[dir_path].append({
+                    "path": rel_path,
+                    "name": file_path.name,
+                    "size": file_path.stat().st_size,
+                })
+                file_count += 1
+
+        # Sort directories and files
+        sorted_dirs = sorted(files_by_dir.keys())
+        result = []
+        for dir_path in sorted_dirs:
+            result.append({
+                "directory": dir_path,
+                "files": sorted(files_by_dir[dir_path], key=lambda f: f["name"]),
+            })
+
+        return {
+            "project_root": str(root),
+            "total_files": file_count,
+            "directories": result,
+        }
+
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket):
         """WebSocket for real-time event streaming."""
@@ -690,6 +777,25 @@ DASHBOARD_HTML = """
                     </div>
                 </div>
                 <div id="qc-panel" class="mt-4">
+                    <!-- File Selection & Manual Trigger -->
+                    <div class="bg-gray-900 rounded p-3 mb-4">
+                        <div class="flex items-center justify-between mb-2">
+                            <h3 class="text-sm font-semibold text-gray-300">Manual Analysis</h3>
+                            <div class="flex gap-2">
+                                <button onclick="loadProjectFiles()" class="text-xs bg-gray-700 hover:bg-gray-600 px-2 py-1 rounded">
+                                    Load Files
+                                </button>
+                                <button id="analyze-btn" onclick="triggerQCAnalysis()" disabled class="text-xs bg-purple-600 hover:bg-purple-700 disabled:bg-gray-600 disabled:cursor-not-allowed px-3 py-1 rounded">
+                                    Analyze Selected
+                                </button>
+                            </div>
+                        </div>
+                        <div id="file-picker" class="max-h-[200px] overflow-y-auto bg-gray-800 rounded p-2 text-xs">
+                            <div class="text-gray-500">Click "Load Files" to see project files</div>
+                        </div>
+                        <div id="selected-files-count" class="text-xs text-gray-400 mt-2">0 files selected</div>
+                    </div>
+
                     <!-- QC Summary -->
                     <div id="qc-summary" class="grid grid-cols-4 gap-4 mb-4">
                         <div class="bg-gray-900 p-3 rounded text-center">
@@ -710,6 +816,21 @@ DASHBOARD_HTML = """
                         </div>
                     </div>
 
+                    <!-- Concerns Filter/Sort -->
+                    <div class="flex gap-2 mb-2">
+                        <select id="qc-severity-filter" onchange="filterConcerns()" class="text-xs bg-gray-700 rounded px-2 py-1">
+                            <option value="all">All Severities</option>
+                            <option value="critical">Critical Only</option>
+                            <option value="high">High & Above</option>
+                            <option value="medium">Medium & Above</option>
+                        </select>
+                        <select id="qc-sort" onchange="filterConcerns()" class="text-xs bg-gray-700 rounded px-2 py-1">
+                            <option value="severity">Sort by Severity</option>
+                            <option value="time">Sort by Time</option>
+                            <option value="category">Sort by Category</option>
+                        </select>
+                    </div>
+
                     <!-- Recent Concerns -->
                     <div class="bg-gray-900 rounded p-3">
                         <h3 class="text-sm font-semibold mb-2 text-gray-300">Recent Concerns</h3>
@@ -725,6 +846,40 @@ DASHBOARD_HTML = """
                             <div class="text-gray-500 text-sm">No reports yet</div>
                         </div>
                     </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Report Detail Modal -->
+        <div id="report-modal" class="fixed inset-0 bg-black bg-opacity-50 hidden z-50 flex items-center justify-center">
+            <div class="bg-gray-800 rounded-lg max-w-4xl w-full mx-4 max-h-[90vh] overflow-hidden flex flex-col">
+                <div class="p-4 border-b border-gray-700 flex items-center justify-between">
+                    <h2 class="text-lg font-semibold" id="modal-report-title">QC Report</h2>
+                    <button onclick="closeReportModal()" class="text-gray-400 hover:text-white text-2xl">&times;</button>
+                </div>
+                <div id="modal-report-content" class="p-4 overflow-y-auto flex-1">
+                    Loading...
+                </div>
+                <div class="p-4 border-t border-gray-700 flex justify-end gap-2">
+                    <button onclick="exportReport()" class="text-xs bg-gray-700 hover:bg-gray-600 px-3 py-1.5 rounded">
+                        Export JSON
+                    </button>
+                    <button onclick="closeReportModal()" class="text-xs bg-blue-600 hover:bg-blue-700 px-3 py-1.5 rounded">
+                        Close
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Concern Detail Modal -->
+        <div id="concern-modal" class="fixed inset-0 bg-black bg-opacity-50 hidden z-50 flex items-center justify-center">
+            <div class="bg-gray-800 rounded-lg max-w-2xl w-full mx-4 max-h-[80vh] overflow-hidden flex flex-col">
+                <div class="p-4 border-b border-gray-700 flex items-center justify-between">
+                    <h2 class="text-lg font-semibold" id="modal-concern-title">Concern Details</h2>
+                    <button onclick="closeConcernModal()" class="text-gray-400 hover:text-white text-2xl">&times;</button>
+                </div>
+                <div id="modal-concern-content" class="p-4 overflow-y-auto flex-1">
+                    Loading...
                 </div>
             </div>
         </div>
@@ -957,7 +1112,7 @@ DASHBOARD_HTML = """
                 const reportsData = await reportsRes.json();
 
                 // Load concerns
-                const concernsRes = await fetch('/api/qc/concerns?limit=20');
+                const concernsRes = await fetch('/api/qc/concerns?limit=50');
                 const concernsData = await concernsRes.json();
 
                 // Update summary counts
@@ -974,23 +1129,11 @@ DASHBOARD_HTML = """
                 document.getElementById('qc-medium-count').textContent = totalMedium;
                 document.getElementById('qc-low-count').textContent = totalLow;
 
-                // Update concerns list
-                const concernsList = document.getElementById('qc-concerns-list');
-                if (concernsData.concerns && concernsData.concerns.length > 0) {
-                    concernsList.innerHTML = concernsData.concerns.map(c => `
-                        <div class="p-2 rounded bg-gray-800 text-sm">
-                            <div class="flex items-center gap-2">
-                                <span class="severity-${c.severity}">${c.severity.toUpperCase()}</span>
-                                <span class="text-white font-medium">${escapeHtml(c.title)}</span>
-                            </div>
-                            <div class="text-gray-400 text-xs mt-1">${escapeHtml(c.domain)} · ${escapeHtml(c.category)}</div>
-                            <div class="text-gray-300 text-xs mt-1">${escapeHtml(c.description?.slice(0, 150) || '')}${c.description?.length > 150 ? '...' : ''}</div>
-                            ${c.affected_files?.length ? `<div class="text-gray-500 text-xs mt-1">Files: ${c.affected_files.join(', ')}</div>` : ''}
-                        </div>
-                    `).join('');
-                } else {
-                    concernsList.innerHTML = '<div class="text-gray-500 text-sm">No concerns yet</div>';
-                }
+                // Store concerns for filtering/sorting
+                allConcernsData = concernsData.concerns || [];
+
+                // Render concerns using the filter function (applies current filters)
+                filterConcerns();
 
                 // Update reports list
                 const reportsList = document.getElementById('qc-reports-list');
@@ -1026,6 +1169,11 @@ DASHBOARD_HTML = """
             }
         }
 
+        // Store current report data for export
+        let currentReportData = null;
+        let allConcernsData = [];
+        let selectedFiles = new Set();
+
         async function showReportDetail(reportId) {
             try {
                 const res = await fetch(`/api/qc/reports/${reportId}`);
@@ -1034,11 +1182,351 @@ DASHBOARD_HTML = """
                     alert('Error loading report: ' + data.error);
                     return;
                 }
-                // For now, show in alert. Could open a modal instead.
-                alert(`Report: ${data.report_id}\\n\\nAssessment: ${data.overall_assessment}\\n\\nRisk: ${data.risk_level}\\nRecommendation: ${data.recommendation}\\n\\nConcerns: ${data.total_concerns}\\nTokens: ${data.total_tokens_used}`);
+
+                currentReportData = data;
+                document.getElementById('modal-report-title').textContent = `QC Report: ${data.report_id}`;
+
+                const riskColors = {
+                    'critical': 'text-red-500',
+                    'high': 'text-orange-500',
+                    'medium': 'text-yellow-500',
+                    'low': 'text-green-500'
+                };
+
+                let html = `
+                    <div class="space-y-4">
+                        <!-- Summary -->
+                        <div class="grid grid-cols-2 gap-4 text-sm">
+                            <div class="bg-gray-900 p-3 rounded">
+                                <div class="text-gray-400">Risk Level</div>
+                                <div class="text-xl font-bold ${riskColors[data.risk_level] || 'text-gray-300'}">${data.risk_level?.toUpperCase() || 'N/A'}</div>
+                            </div>
+                            <div class="bg-gray-900 p-3 rounded">
+                                <div class="text-gray-400">Recommendation</div>
+                                <div class="text-xl font-bold ${getRecommendationClass(data.recommendation).replace('bg-', 'text-').replace('-900', '-400')}">${data.recommendation?.toUpperCase() || 'N/A'}</div>
+                            </div>
+                        </div>
+
+                        <!-- Assessment -->
+                        <div class="bg-gray-900 p-3 rounded">
+                            <div class="text-gray-400 text-sm mb-1">Overall Assessment</div>
+                            <div class="text-gray-200">${escapeHtml(data.overall_assessment || 'No assessment')}</div>
+                        </div>
+
+                        <!-- Stats -->
+                        <div class="grid grid-cols-4 gap-2 text-center text-xs">
+                            <div class="bg-gray-900 p-2 rounded">
+                                <div class="text-red-500 font-bold">${data.critical_count || 0}</div>
+                                <div class="text-gray-500">Critical</div>
+                            </div>
+                            <div class="bg-gray-900 p-2 rounded">
+                                <div class="text-orange-500 font-bold">${data.high_count || 0}</div>
+                                <div class="text-gray-500">High</div>
+                            </div>
+                            <div class="bg-gray-900 p-2 rounded">
+                                <div class="text-yellow-500 font-bold">${data.medium_count || 0}</div>
+                                <div class="text-gray-500">Medium</div>
+                            </div>
+                            <div class="bg-gray-900 p-2 rounded">
+                                <div class="text-green-500 font-bold">${data.low_count || 0}</div>
+                                <div class="text-gray-500">Low</div>
+                            </div>
+                        </div>
+
+                        <!-- Concerns -->
+                        <div class="bg-gray-900 p-3 rounded">
+                            <div class="text-gray-400 text-sm mb-2">Concerns (${data.concerns?.length || 0})</div>
+                            <div class="space-y-2 max-h-[300px] overflow-y-auto">
+                                ${(data.concerns || []).map(c => `
+                                    <div class="p-2 bg-gray-800 rounded cursor-pointer hover:bg-gray-700" onclick="showConcernDetail('${c.concern_id}')">
+                                        <div class="flex items-center gap-2">
+                                            <span class="severity-${c.severity}">${c.severity?.toUpperCase()}</span>
+                                            <span class="text-white font-medium text-sm">${escapeHtml(c.title)}</span>
+                                        </div>
+                                        <div class="text-gray-400 text-xs mt-1">${escapeHtml(c.domain)} · ${escapeHtml(c.category)}</div>
+                                    </div>
+                                `).join('') || '<div class="text-gray-500">No concerns</div>'}
+                            </div>
+                        </div>
+
+                        <!-- Action Items -->
+                        ${data.action_items?.length ? `
+                        <div class="bg-gray-900 p-3 rounded">
+                            <div class="text-gray-400 text-sm mb-2">Action Items</div>
+                            <div class="space-y-2">
+                                ${data.action_items.map(a => `
+                                    <div class="p-2 bg-gray-800 rounded text-sm">
+                                        <div class="flex items-center gap-2">
+                                            <span class="text-xs px-1.5 py-0.5 rounded bg-blue-900 text-blue-300">P${a.priority}</span>
+                                            <span class="text-white">${escapeHtml(a.title)}</span>
+                                        </div>
+                                        <div class="text-gray-400 text-xs mt-1">${escapeHtml(a.description)}</div>
+                                    </div>
+                                `).join('')}
+                            </div>
+                        </div>
+                        ` : ''}
+
+                        <!-- Metadata -->
+                        <div class="text-xs text-gray-500 flex gap-4">
+                            <span>Time: ${data.total_analysis_time_ms}ms</span>
+                            <span>Tokens: ${data.total_tokens_used}</span>
+                            <span>Agents: ${(data.agents_consulted || []).join(', ') || 'None'}</span>
+                        </div>
+                    </div>
+                `;
+
+                document.getElementById('modal-report-content').innerHTML = html;
+                document.getElementById('report-modal').classList.remove('hidden');
             } catch (e) {
                 console.error('Failed to load report:', e);
+                alert('Failed to load report: ' + e.message);
             }
+        }
+
+        function closeReportModal() {
+            document.getElementById('report-modal').classList.add('hidden');
+        }
+
+        function exportReport() {
+            if (!currentReportData) return;
+            const blob = new Blob([JSON.stringify(currentReportData, null, 2)], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `qc-report-${currentReportData.report_id}.json`;
+            a.click();
+            URL.revokeObjectURL(url);
+        }
+
+        function showConcernDetail(concernId) {
+            // Find concern from current report
+            const concern = currentReportData?.concerns?.find(c => c.concern_id === concernId);
+            if (!concern) return;
+
+            document.getElementById('modal-concern-title').textContent = concern.title;
+            document.getElementById('modal-concern-content').innerHTML = `
+                <div class="space-y-3">
+                    <div class="flex gap-2">
+                        <span class="severity-${concern.severity} text-sm">${concern.severity?.toUpperCase()}</span>
+                        <span class="text-xs px-2 py-0.5 rounded bg-gray-700 text-gray-300">${concern.category}</span>
+                    </div>
+                    <div class="bg-gray-900 p-3 rounded">
+                        <div class="text-gray-400 text-xs mb-1">Description</div>
+                        <div class="text-gray-200 text-sm">${escapeHtml(concern.description)}</div>
+                    </div>
+                    ${concern.suggestion ? `
+                    <div class="bg-gray-900 p-3 rounded">
+                        <div class="text-gray-400 text-xs mb-1">Suggestion</div>
+                        <div class="text-green-300 text-sm">${escapeHtml(concern.suggestion)}</div>
+                    </div>
+                    ` : ''}
+                    ${concern.affected_files?.length ? `
+                    <div class="bg-gray-900 p-3 rounded">
+                        <div class="text-gray-400 text-xs mb-1">Affected Files</div>
+                        <div class="text-gray-300 text-sm font-mono">${concern.affected_files.join('<br>')}</div>
+                    </div>
+                    ` : ''}
+                    ${concern.affected_functions?.length ? `
+                    <div class="bg-gray-900 p-3 rounded">
+                        <div class="text-gray-400 text-xs mb-1">Affected Functions</div>
+                        <div class="text-gray-300 text-sm font-mono">${concern.affected_functions.join(', ')}</div>
+                    </div>
+                    ` : ''}
+                    <div class="text-xs text-gray-500">
+                        <span>Domain: ${concern.domain}</span> ·
+                        <span>Agent: ${concern.agent_id}</span> ·
+                        <span>Confidence: ${(concern.confidence * 100).toFixed(0)}%</span>
+                    </div>
+                </div>
+            `;
+            document.getElementById('concern-modal').classList.remove('hidden');
+        }
+
+        function closeConcernModal() {
+            document.getElementById('concern-modal').classList.add('hidden');
+        }
+
+        // File picker functions
+        async function loadProjectFiles() {
+            const picker = document.getElementById('file-picker');
+            picker.innerHTML = '<div class="text-gray-400">Loading files...</div>';
+
+            try {
+                const res = await fetch('/api/files');
+                const data = await res.json();
+
+                if (data.error) {
+                    picker.innerHTML = `<div class="text-red-400">${escapeHtml(data.error)}</div>`;
+                    return;
+                }
+
+                if (!data.directories || data.directories.length === 0) {
+                    picker.innerHTML = '<div class="text-gray-500">No files found</div>';
+                    return;
+                }
+
+                let html = '';
+                for (const dir of data.directories) {
+                    html += `
+                        <div class="mb-2">
+                            <div class="flex items-center gap-1 text-gray-400 font-medium">
+                                <input type="checkbox" class="dir-checkbox" data-dir="${escapeHtml(dir.directory)}" onchange="toggleDirectory(this)">
+                                <span>📁 ${escapeHtml(dir.directory)}</span>
+                            </div>
+                            <div class="ml-4 space-y-0.5">
+                                ${dir.files.map(f => `
+                                    <label class="flex items-center gap-1 hover:bg-gray-700 rounded px-1 cursor-pointer">
+                                        <input type="checkbox" class="file-checkbox" data-path="${escapeHtml(f.path)}" onchange="updateSelectedCount()">
+                                        <span class="text-gray-300">${escapeHtml(f.name)}</span>
+                                        <span class="text-gray-600 text-xs">(${(f.size / 1024).toFixed(1)}KB)</span>
+                                    </label>
+                                `).join('')}
+                            </div>
+                        </div>
+                    `;
+                }
+
+                picker.innerHTML = html;
+                updateSelectedCount();
+            } catch (e) {
+                picker.innerHTML = `<div class="text-red-400">Error: ${escapeHtml(e.message)}</div>`;
+            }
+        }
+
+        function toggleDirectory(checkbox) {
+            const dir = checkbox.dataset.dir;
+            const fileCheckboxes = document.querySelectorAll(`.file-checkbox[data-path^="${dir}/"]`);
+            fileCheckboxes.forEach(cb => cb.checked = checkbox.checked);
+            updateSelectedCount();
+        }
+
+        function updateSelectedCount() {
+            const checked = document.querySelectorAll('.file-checkbox:checked');
+            selectedFiles = new Set([...checked].map(cb => cb.dataset.path));
+            document.getElementById('selected-files-count').textContent = `${selectedFiles.size} files selected`;
+            document.getElementById('analyze-btn').disabled = selectedFiles.size === 0;
+        }
+
+        async function triggerQCAnalysis() {
+            if (selectedFiles.size === 0) {
+                alert('Please select files to analyze');
+                return;
+            }
+
+            const btn = document.getElementById('analyze-btn');
+            btn.disabled = true;
+            btn.textContent = 'Analyzing...';
+
+            try {
+                const res = await fetch('/api/qc/analyze', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ files: [...selectedFiles] })
+                });
+                const data = await res.json();
+
+                if (data.error) {
+                    alert('Analysis failed: ' + data.error);
+                } else {
+                    // Analysis completed - refresh reports
+                    await loadQCReports();
+                    // Show the new report
+                    if (data.report_id) {
+                        showReportDetail(data.report_id);
+                    }
+                }
+            } catch (e) {
+                alert('Analysis failed: ' + e.message);
+            }
+
+            btn.disabled = false;
+            btn.textContent = 'Analyze Selected';
+            updateSelectedCount();
+        }
+
+        // Filter and sort concerns
+        function filterConcerns() {
+            const filter = document.getElementById('qc-severity-filter').value;
+            const sort = document.getElementById('qc-sort').value;
+
+            let concerns = [...allConcernsData];
+
+            // Filter by severity
+            if (filter !== 'all') {
+                const severityOrder = ['critical', 'high', 'medium', 'low', 'info'];
+                const filterIndex = severityOrder.indexOf(filter);
+                concerns = concerns.filter(c => severityOrder.indexOf(c.severity) <= filterIndex);
+            }
+
+            // Sort
+            if (sort === 'severity') {
+                const severityOrder = { 'critical': 0, 'high': 1, 'medium': 2, 'low': 3, 'info': 4 };
+                concerns.sort((a, b) => (severityOrder[a.severity] || 5) - (severityOrder[b.severity] || 5));
+            } else if (sort === 'time') {
+                concerns.sort((a, b) => new Date(b.raised_at) - new Date(a.raised_at));
+            } else if (sort === 'category') {
+                concerns.sort((a, b) => (a.category || '').localeCompare(b.category || ''));
+            }
+
+            renderConcernsList(concerns);
+        }
+
+        function renderConcernsList(concerns) {
+            const concernsList = document.getElementById('qc-concerns-list');
+            if (concerns && concerns.length > 0) {
+                concernsList.innerHTML = concerns.map(c => `
+                    <div class="p-2 rounded bg-gray-800 text-sm cursor-pointer hover:bg-gray-700 concern-item" onclick="showConcernFromList('${c.concern_id}', '${c.report_id}')">
+                        <div class="flex items-center gap-2">
+                            <span class="severity-${c.severity}">${c.severity.toUpperCase()}</span>
+                            <span class="text-white font-medium">${escapeHtml(c.title)}</span>
+                        </div>
+                        <div class="text-gray-400 text-xs mt-1">${escapeHtml(c.domain)} · ${escapeHtml(c.category)}</div>
+                        <div class="text-gray-300 text-xs mt-1">${escapeHtml(c.description?.slice(0, 150) || '')}${c.description?.length > 150 ? '...' : ''}</div>
+                        ${c.affected_files?.length ? `<div class="text-gray-500 text-xs mt-1">Files: ${c.affected_files.join(', ')}</div>` : ''}
+                    </div>
+                `).join('');
+            } else {
+                concernsList.innerHTML = '<div class="text-gray-500 text-sm">No concerns match filter</div>';
+            }
+        }
+
+        async function showConcernFromList(concernId, reportId) {
+            // Load the full report to get concern details
+            try {
+                const res = await fetch(`/api/qc/reports/${reportId}`);
+                const data = await res.json();
+                if (!data.error) {
+                    currentReportData = data;
+                    showConcernDetail(concernId);
+                }
+            } catch (e) {
+                console.error('Failed to load concern details:', e);
+            }
+        }
+
+        // Add real-time concern to the stream
+        function addConcernToStream(concernData) {
+            // Add to our local data
+            allConcernsData.unshift({
+                ...concernData,
+                raised_at: new Date().toISOString()
+            });
+            // Keep only recent ones
+            if (allConcernsData.length > 50) {
+                allConcernsData = allConcernsData.slice(0, 50);
+            }
+            // Re-render with current filters
+            filterConcerns();
+
+            // Flash the concern item
+            setTimeout(() => {
+                const firstItem = document.querySelector('.concern-item');
+                if (firstItem) {
+                    firstItem.classList.add('bg-purple-900');
+                    setTimeout(() => firstItem.classList.remove('bg-purple-900'), 1000);
+                }
+            }, 100);
         }
 
         function connectWebSocket() {
@@ -1059,6 +1547,12 @@ DASHBOARD_HTML = """
                 addEvent(data);
                 loadTraces();
                 loadStats();
+
+                // Handle real-time concern streaming
+                if (data.event_type === 'concern_raised' && data.data) {
+                    addConcernToStream(data.data);
+                }
+
                 // Refresh QC panel on QC events
                 if (data.event_type && data.event_type.startsWith('analysis_') ||
                     data.event_type === 'concern_raised' ||
