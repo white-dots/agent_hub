@@ -2,12 +2,19 @@
 
 This module builds and analyzes import dependency graphs to identify
 natural module clusters without relying on hardcoded patterns.
+
+Supports:
+- Python (.py) files with AST parsing
+- TypeScript/JavaScript (.ts, .tsx, .js, .jsx) files with regex parsing
 """
 
 import ast
+import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from agenthub.auto.ignore import IgnorePatterns
 
 
 @dataclass
@@ -16,7 +23,7 @@ class ImportEdge:
 
     source: str  # File that imports (relative path)
     target: str  # File being imported (relative path)
-    import_type: str  # "direct" | "from" | "relative"
+    import_type: str  # "direct" | "from" | "relative" | "require"
     imported_names: list[str] = field(default_factory=list)  # Specific names imported
 
 
@@ -25,18 +32,25 @@ class ModuleNode:
     """Represents a module in the import graph."""
 
     path: str  # Relative path from project root
+    language: str = "python"  # "python" | "typescript" | "javascript"
     imports: list[str] = field(default_factory=list)  # Modules this imports
     imported_by: list[str] = field(default_factory=list)  # Modules that import this
     functions: list[str] = field(default_factory=list)  # Function names defined
     classes: list[str] = field(default_factory=list)  # Class names defined
+    size_bytes: int = 0  # File size in bytes
 
 
 class ImportGraph:
     """Builds and analyzes import dependency graphs.
 
-    This class parses Python files to extract import statements,
-    resolves them to actual file paths, and provides methods to
-    analyze the dependency structure.
+    This class parses Python and TypeScript/JavaScript files to extract
+    import statements, resolves them to actual file paths, and provides
+    methods to analyze the dependency structure.
+
+    Supports:
+    - Python (.py) using AST parsing
+    - TypeScript (.ts, .tsx) using regex parsing
+    - JavaScript (.js, .jsx) using regex parsing
 
     Example:
         >>> graph = ImportGraph("./my-project")
@@ -46,36 +60,82 @@ class ImportGraph:
         ...     print(f"Cluster: {cluster}")
     """
 
-    def __init__(self, root_path: str, ignore_patterns: list[str] | None = None):
+    # Supported file extensions by language
+    EXTENSIONS = {
+        "python": [".py"],
+        "typescript": [".ts", ".tsx"],
+        "javascript": [".js", ".jsx"],
+    }
+
+    # Regex patterns for TypeScript/JavaScript imports
+    TS_IMPORT_PATTERNS = [
+        # import x from 'y'
+        re.compile(r"import\s+(\w+)\s+from\s+['\"]([^'\"]+)['\"]"),
+        # import { x, y } from 'z'
+        re.compile(r"import\s+\{([^}]+)\}\s+from\s+['\"]([^'\"]+)['\"]"),
+        # import * as x from 'y'
+        re.compile(r"import\s+\*\s+as\s+(\w+)\s+from\s+['\"]([^'\"]+)['\"]"),
+        # import 'x' (side-effect import)
+        re.compile(r"import\s+['\"]([^'\"]+)['\"]"),
+        # const x = require('y')
+        re.compile(r"(?:const|let|var)\s+(\w+)\s*=\s*require\s*\(\s*['\"]([^'\"]+)['\"]\s*\)"),
+        # require('x')
+        re.compile(r"require\s*\(\s*['\"]([^'\"]+)['\"]\s*\)"),
+        # export { x } from 'y'
+        re.compile(r"export\s+\{[^}]+\}\s+from\s+['\"]([^'\"]+)['\"]"),
+        # export * from 'y'
+        re.compile(r"export\s+\*\s+from\s+['\"]([^'\"]+)['\"]"),
+    ]
+
+    # Regex for TS/JS function and class definitions
+    TS_FUNCTION_PATTERN = re.compile(
+        r"(?:export\s+)?(?:async\s+)?function\s+(\w+)|"
+        r"(?:export\s+)?const\s+(\w+)\s*=\s*(?:async\s+)?\([^)]*\)\s*(?::\s*[^=]+)?\s*=>|"
+        r"(?:export\s+)?const\s+(\w+)\s*=\s*(?:async\s+)?function"
+    )
+    TS_CLASS_PATTERN = re.compile(r"(?:export\s+)?class\s+(\w+)")
+
+    def __init__(
+        self,
+        root_path: str,
+        ignore_patterns: list[str] | None = None,
+        extensions: list[str] | None = None,
+    ):
         """Initialize the import graph.
 
         Args:
             root_path: Path to the project root directory.
-            ignore_patterns: Patterns to ignore (e.g., ["test_*", "__pycache__"]).
+            ignore_patterns: Additional patterns to ignore.
+            extensions: File extensions to include. Defaults to all supported.
         """
         self.root_path = Path(root_path).resolve()
-        self.ignore_patterns = ignore_patterns or [
-            "__pycache__",
-            ".git",
-            ".venv",
-            "venv",
-            "node_modules",
-            "*.egg-info",
-            "build",
-            "dist",
-        ]
+
+        # Use IgnorePatterns for smart filtering
+        self._ignore = IgnorePatterns(root_path)
+
+        # Additional ignore patterns (legacy support)
+        self.ignore_patterns = ignore_patterns or []
+
+        # Determine which extensions to use
+        if extensions:
+            self.extensions = extensions
+        else:
+            # Default: all supported extensions
+            self.extensions = []
+            for ext_list in self.EXTENSIONS.values():
+                self.extensions.extend(ext_list)
 
         self.nodes: dict[str, ModuleNode] = {}
         self.edges: list[ImportEdge] = []
         self._built = False
 
     def build(self) -> None:
-        """Parse all Python files and build the import graph."""
-        # Find all Python files
-        python_files = self._find_python_files()
+        """Parse all source files and build the import graph."""
+        # Find all source files
+        source_files = self._find_source_files()
 
         # Parse each file
-        for file_path in python_files:
+        for file_path in source_files:
             rel_path = str(file_path.relative_to(self.root_path))
             self._parse_file(file_path, rel_path)
 
@@ -84,29 +144,64 @@ class ImportGraph:
 
         self._built = True
 
-    def _find_python_files(self) -> list[Path]:
-        """Find all Python files in the project."""
+    def _find_source_files(self) -> list[Path]:
+        """Find all source files in the project."""
         files = []
-        for path in self.root_path.rglob("*.py"):
-            # Check ignore patterns
-            rel_path = path.relative_to(self.root_path)
-            if any(
-                part in self.ignore_patterns or part.startswith(".")
-                for part in rel_path.parts
-            ):
-                continue
-            files.append(path)
+
+        for ext in self.extensions:
+            for path in self.root_path.rglob(f"*{ext}"):
+                # Get relative path
+                rel_path = path.relative_to(self.root_path)
+                rel_str = str(rel_path)
+
+                # Check .agenthubignore patterns
+                if self._ignore.is_ignored(rel_str):
+                    continue
+
+                # Check legacy ignore patterns
+                if any(
+                    part in self.ignore_patterns or part.startswith(".")
+                    for part in rel_path.parts
+                ):
+                    continue
+
+                files.append(path)
+
         return files
 
+    def _get_language(self, file_path: Path) -> str:
+        """Determine the language of a file based on extension."""
+        suffix = file_path.suffix.lower()
+        for lang, exts in self.EXTENSIONS.items():
+            if suffix in exts:
+                return lang
+        return "unknown"
+
     def _parse_file(self, file_path: Path, rel_path: str) -> None:
-        """Parse a single Python file for imports and definitions."""
+        """Parse a source file for imports and definitions."""
+        language = self._get_language(file_path)
+
         try:
             content = file_path.read_text(encoding="utf-8", errors="ignore")
-            tree = ast.parse(content, filename=str(file_path))
-        except (SyntaxError, UnicodeDecodeError):
+            file_size = file_path.stat().st_size
+        except (OSError, UnicodeDecodeError):
             return
 
-        node = ModuleNode(path=rel_path)
+        if language == "python":
+            self._parse_python_file(content, rel_path, file_size)
+        elif language in ("typescript", "javascript"):
+            self._parse_ts_js_file(content, rel_path, language, file_size)
+
+    def _parse_python_file(
+        self, content: str, rel_path: str, file_size: int
+    ) -> None:
+        """Parse a Python file using AST."""
+        try:
+            tree = ast.parse(content)
+        except SyntaxError:
+            return
+
+        node = ModuleNode(path=rel_path, language="python", size_bytes=file_size)
 
         for ast_node in ast.walk(tree):
             # Extract imports
@@ -156,6 +251,72 @@ class ImportGraph:
 
         self.nodes[rel_path] = node
 
+    def _parse_ts_js_file(
+        self, content: str, rel_path: str, language: str, file_size: int
+    ) -> None:
+        """Parse a TypeScript/JavaScript file using regex."""
+        node = ModuleNode(path=rel_path, language=language, size_bytes=file_size)
+
+        # Extract imports using regex patterns
+        for pattern in self.TS_IMPORT_PATTERNS:
+            for match in pattern.finditer(content):
+                groups = match.groups()
+                # Last non-None group is typically the import path
+                import_path = None
+                imported_names = []
+
+                for g in reversed(groups):
+                    if g is not None:
+                        if import_path is None:
+                            import_path = g
+                        else:
+                            # This is imported names
+                            if "," in g:
+                                imported_names = [
+                                    n.strip().split(" as ")[0].strip()
+                                    for n in g.split(",")
+                                ]
+                            else:
+                                imported_names = [g.strip()]
+
+                if import_path:
+                    # Determine import type
+                    if import_path.startswith("."):
+                        import_type = "relative"
+                    elif "require" in pattern.pattern:
+                        import_type = "require"
+                    else:
+                        import_type = "from"
+
+                    self.edges.append(
+                        ImportEdge(
+                            source=rel_path,
+                            target=import_path,
+                            import_type=import_type,
+                            imported_names=imported_names,
+                        )
+                    )
+                    node.imports.append(import_path)
+
+        # Extract functions
+        for match in self.TS_FUNCTION_PATTERN.finditer(content):
+            for name in match.groups():
+                if name and not name.startswith("_"):
+                    node.functions.append(name)
+
+        # Extract classes
+        for match in self.TS_CLASS_PATTERN.finditer(content):
+            name = match.group(1)
+            if name and not name.startswith("_"):
+                node.classes.append(name)
+
+        # Deduplicate
+        node.functions = list(dict.fromkeys(node.functions))
+        node.classes = list(dict.fromkeys(node.classes))
+        node.imports = list(dict.fromkeys(node.imports))
+
+        self.nodes[rel_path] = node
+
     def _resolve_imports(self) -> None:
         """Resolve import targets to actual file paths within the project."""
         # Build a mapping of module names to file paths
@@ -166,51 +327,154 @@ class ImportGraph:
         project_name = self.root_path.name
 
         for rel_path in self.nodes:
-            # Convert path to module name
-            # e.g., "auto/config.py" -> "auto.config"
-            module_name = rel_path.replace("/", ".").replace("\\", ".")
-            if module_name.endswith(".py"):
-                module_name = module_name[:-3]
-            if module_name.endswith(".__init__"):
-                module_name = module_name[:-9]
+            node = self.nodes[rel_path]
 
-            # Map the full relative path
-            module_map[module_name] = rel_path
+            if node.language == "python":
+                # Python: Convert path to module name
+                # e.g., "auto/config.py" -> "auto.config"
+                module_name = rel_path.replace("/", ".").replace("\\", ".")
+                if module_name.endswith(".py"):
+                    module_name = module_name[:-3]
+                if module_name.endswith(".__init__"):
+                    module_name = module_name[:-9]
 
-            # Map with project name prefix (e.g., "agenthub.auto.config")
-            module_map[f"{project_name}.{module_name}"] = rel_path
+                # Map the full relative path
+                module_map[module_name] = rel_path
 
-            # Map partial paths from the end
-            parts = module_name.split(".")
-            for i in range(len(parts)):
-                partial = ".".join(parts[i:])
-                if partial not in module_map:
-                    module_map[partial] = rel_path
+                # Map with project name prefix (e.g., "agenthub.auto.config")
+                module_map[f"{project_name}.{module_name}"] = rel_path
 
-            # Map just the file stem (e.g., "config")
-            stem = Path(rel_path).stem
-            if stem != "__init__" and stem not in module_map:
-                module_map[stem] = rel_path
+                # Map partial paths from the end
+                parts = module_name.split(".")
+                for i in range(len(parts)):
+                    partial = ".".join(parts[i:])
+                    if partial not in module_map:
+                        module_map[partial] = rel_path
+
+                # Map just the file stem (e.g., "config")
+                stem = Path(rel_path).stem
+                if stem != "__init__" and stem not in module_map:
+                    module_map[stem] = rel_path
+
+            else:
+                # TypeScript/JavaScript: Map by relative path patterns
+                # e.g., "src/components/Button.tsx" -> various patterns
+
+                # Map without extension
+                no_ext = str(Path(rel_path).with_suffix(""))
+                module_map[no_ext] = rel_path
+
+                # Map with ./ prefix (common in TS/JS)
+                module_map["./" + no_ext] = rel_path
+
+                # Map relative from src/
+                if no_ext.startswith("src/"):
+                    module_map[no_ext[4:]] = rel_path
+                    module_map["./" + no_ext[4:]] = rel_path
+
+                # Map just the filename (without extension)
+                stem = Path(rel_path).stem
+                if stem != "index" and stem not in module_map:
+                    module_map[stem] = rel_path
+
+                # Map directory (for index.ts imports)
+                if stem == "index":
+                    dir_path = str(Path(rel_path).parent)
+                    if dir_path not in module_map:
+                        module_map[dir_path] = rel_path
+                    module_map["./" + dir_path] = rel_path
+
+        # TS/JS: Skip common third-party packages
+        ts_js_stdlib = {
+            "react", "react-dom", "next", "vue", "svelte", "angular",
+            "express", "fastify", "koa", "hono",
+            "axios", "fetch", "node-fetch",
+            "lodash", "underscore", "ramda",
+            "moment", "dayjs", "date-fns",
+            "zod", "yup", "joi",
+            "tailwindcss", "styled-components", "emotion",
+            "@tanstack/react-query", "@reduxjs/toolkit", "redux",
+            "zustand", "jotai", "recoil", "mobx",
+            "prisma", "drizzle", "typeorm", "sequelize",
+            "vitest", "jest", "mocha", "chai",
+            "typescript", "ts-node",
+            "path", "fs", "http", "https", "url", "crypto", "util",
+            "child_process", "stream", "events", "os", "buffer",
+        }
+
+        # Python stdlib/third-party to skip
+        python_stdlib = {
+            "os", "sys", "re", "json", "typing", "pathlib", "datetime",
+            "collections", "functools", "itertools", "dataclasses",
+            "abc", "ast", "enum", "copy", "time", "logging", "argparse",
+            "anthropic", "openai", "pydantic", "fastapi", "uvicorn",
+            "watchdog", "dotenv", "asyncio", "concurrent", "threading",
+            "multiprocessing", "socket", "http", "urllib", "email",
+            "html", "xml", "sqlite3", "hashlib", "hmac", "secrets",
+            "base64", "binascii", "struct", "codecs", "io", "tempfile",
+            "shutil", "glob", "fnmatch", "linecache", "pickle", "shelve",
+            "csv", "configparser", "tomllib", "subprocess", "signal",
+            "contextvars", "inspect", "traceback", "warnings", "unittest",
+            "pytest", "numpy", "pandas", "scipy", "matplotlib", "sklearn",
+            "sqlalchemy", "alembic", "redis", "celery", "requests", "httpx",
+            "aiohttp", "flask", "django", "starlette", "pydantic_settings",
+        }
 
         # Resolve each edge
         resolved_edges: list[ImportEdge] = []
         for edge in self.edges:
             target = edge.target
+            source_node = self.nodes.get(edge.source)
+            source_lang = source_node.language if source_node else "python"
 
             # Skip stdlib and third-party imports
-            if target in {
-                "os", "sys", "re", "json", "typing", "pathlib", "datetime",
-                "collections", "functools", "itertools", "dataclasses",
-                "abc", "ast", "enum", "copy", "time", "logging", "argparse",
-                "anthropic", "openai", "pydantic", "fastapi", "uvicorn",
-                "watchdog", "dotenv",
-            }:
-                continue
+            skip_set = python_stdlib if source_lang == "python" else ts_js_stdlib
+
+            # Check if target is a known library
+            target_base = target.split("/")[0].split(".")[0].lstrip("@")
+            if target_base in skip_set or target.startswith("@"):
+                # Skip @scoped packages unless they resolve locally
+                if target.startswith("@") and target not in module_map:
+                    continue
+                elif target_base in skip_set:
+                    continue
 
             # Try to find the target in our module map
             resolved_path = module_map.get(target)
 
-            # Try stripping common package prefixes
+            # For relative TS/JS imports, resolve the path
+            if not resolved_path and target.startswith("."):
+                source_dir = str(Path(edge.source).parent)
+                # Normalize the relative import
+                if target.startswith("./"):
+                    candidate = source_dir + "/" + target[2:] if source_dir != "." else target[2:]
+                elif target.startswith("../"):
+                    parts = source_dir.split("/")
+                    target_parts = target.split("/")
+                    up_count = 0
+                    for p in target_parts:
+                        if p == "..":
+                            up_count += 1
+                        else:
+                            break
+                    base = "/".join(parts[:-up_count]) if up_count <= len(parts) else ""
+                    rest = "/".join(target_parts[up_count:])
+                    candidate = base + "/" + rest if base else rest
+                else:
+                    candidate = target
+
+                # Try with different extensions
+                for ext in ["", ".ts", ".tsx", ".js", ".jsx", "/index.ts", "/index.tsx", "/index.js"]:
+                    test_path = candidate + ext
+                    if test_path in module_map:
+                        resolved_path = module_map[test_path]
+                        break
+                    # Also check direct match in nodes
+                    if test_path in self.nodes:
+                        resolved_path = test_path
+                        break
+
+            # Try stripping common package prefixes (Python)
             if not resolved_path:
                 for prefix in [f"{project_name}.", "src.", "lib.", "app."]:
                     if target.startswith(prefix):
@@ -480,6 +744,12 @@ class ImportGraph:
 
         clusters = self.get_clusters()
 
+        # Calculate size stats
+        total_size = sum(n.size_bytes for n in self.nodes.values())
+        py_count = sum(1 for n in self.nodes.values() if n.language == "python")
+        ts_count = sum(1 for n in self.nodes.values() if n.language == "typescript")
+        js_count = sum(1 for n in self.nodes.values() if n.language == "javascript")
+
         return {
             "total_modules": len(self.nodes),
             "total_edges": len(self.edges),
@@ -492,4 +762,38 @@ class ImportGraph:
             "leaf_modules": sum(
                 1 for p in self.nodes if self.get_module_role(p) == "leaf"
             ),
+            "total_size_bytes": total_size,
+            "total_size_kb": total_size / 1024,
+            "python_modules": py_count,
+            "typescript_modules": ts_count,
+            "javascript_modules": js_count,
         }
+
+    def get_cluster_size(self, cluster: set[str]) -> int:
+        """Get total size in bytes of all modules in a cluster.
+
+        Args:
+            cluster: Set of module paths.
+
+        Returns:
+            Total size in bytes.
+        """
+        return sum(
+            self.nodes[path].size_bytes
+            for path in cluster
+            if path in self.nodes
+        )
+
+    def get_modules_by_language(self, language: str) -> list[str]:
+        """Get all module paths for a specific language.
+
+        Args:
+            language: "python", "typescript", or "javascript"
+
+        Returns:
+            List of module paths.
+        """
+        return [
+            path for path, node in self.nodes.items()
+            if node.language == language
+        ]

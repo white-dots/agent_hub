@@ -30,6 +30,8 @@ class Domain:
     related_tier_a: list[str] = field(default_factory=list)  # Related Tier A agent IDs
     folder_prefix: str = ""  # Common folder prefix if any
     description: str = ""  # Auto-generated description
+    total_size_bytes: int = 0  # Total size of all modules in bytes
+    primary_language: str = "python"  # Primary language ("python", "typescript", "javascript")
 
 
 class DomainAnalysis:
@@ -241,6 +243,19 @@ class DomainAnalysis:
         # Generate description
         description = self._generate_description(module_list, keywords, central)
 
+        # Calculate total size and primary language
+        total_size = 0
+        language_counts: Counter[str] = Counter()
+        for module_path in module_list:
+            if module_path in self.graph.nodes:
+                node = self.graph.nodes[module_path]
+                total_size += node.size_bytes
+                language_counts[node.language] += 1
+
+        primary_language = "python"
+        if language_counts:
+            primary_language = language_counts.most_common(1)[0][0]
+
         return Domain(
             name=name,
             agent_id=agent_id,
@@ -249,6 +264,8 @@ class DomainAnalysis:
             keywords=keywords,
             folder_prefix=folder_prefix,
             description=description,
+            total_size_bytes=total_size,
+            primary_language=primary_language,
         )
 
     def _find_central_module(self, modules: list[str]) -> str:

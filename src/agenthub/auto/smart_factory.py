@@ -29,6 +29,23 @@ if TYPE_CHECKING:
 class SmartCodeAgent(BaseAgent):
     """Auto-generated agent with semantic understanding of its module."""
 
+    # Language hints for code blocks
+    LANG_MAP = {
+        ".py": "python",
+        ".ts": "typescript",
+        ".tsx": "tsx",
+        ".js": "javascript",
+        ".jsx": "jsx",
+        ".json": "json",
+        ".sql": "sql",
+        ".css": "css",
+        ".scss": "scss",
+        ".html": "html",
+        ".yaml": "yaml",
+        ".yml": "yaml",
+        ".md": "markdown",
+    }
+
     def __init__(
         self,
         spec: AgentSpec,
@@ -51,7 +68,10 @@ class SmartCodeAgent(BaseAgent):
             if full_path.exists():
                 try:
                     content = full_path.read_text(encoding="utf-8", errors="ignore")
-                    parts.append(f"### {module_path}\n```python\n{content}\n```")
+                    # Determine language for syntax highlighting
+                    suffix = full_path.suffix.lower()
+                    lang = self.LANG_MAP.get(suffix, "")
+                    parts.append(f"### {module_path}\n```{lang}\n{content}\n```")
                 except Exception:
                     pass
 
@@ -554,13 +574,24 @@ Reference specific code in your answers.""",
         )
         system_prompt = rnr_generator.generate_system_prompt(domain, rnr)
 
+        # Calculate context size based on domain size
+        # Use domain's total size as a baseline, with some headroom
+        domain_size_kb = domain.total_size_bytes / 1024
+        # Context should be at least 1.5x the source size to allow for formatting
+        # But capped at configured max
+        min_context_kb = max(50, domain_size_kb * 1.5)
+        context_size_kb = min(
+            max(min_context_kb, self.config.max_agent_context_kb),
+            self.config.max_agent_context_kb * 2,  # Allow 2x for large domains
+        )
+
         spec = AgentSpec(
             agent_id=domain.agent_id,
             name=domain.name + " Expert",
             description=domain.description,
             context_keywords=domain.keywords,
             context_paths=domain.modules,
-            max_context_size=self.config.max_agent_context_kb * 1024,
+            max_context_size=int(context_size_kb * 1024),
             system_prompt=system_prompt,
             metadata={
                 "auto_generated": True,
@@ -571,6 +602,10 @@ Reference specific code in your answers.""",
                 "related_tier_a": domain.related_tier_a,
                 "generated_at": datetime.now().isoformat(),
                 "detection_mode": "dynamic",
+                "primary_language": domain.primary_language,
+                "total_size_bytes": domain.total_size_bytes,
+                "total_size_kb": round(domain_size_kb, 2),
+                "context_size_kb": round(context_size_kb, 2),
                 "rnr": {
                     "role": rnr.role,
                     "in_scope": rnr.in_scope,
