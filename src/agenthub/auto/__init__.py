@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Auto-agent generation for existing codebases.
 
 This module provides automatic agent generation based on codebase
@@ -23,6 +24,7 @@ Three approaches available:
    >>> agents = enable_auto_agents(hub, "./my-project")
 """
 
+from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 from agenthub.auto.analyzer import AgentBoundary, CodebaseAnalyzer, FolderStats
@@ -54,9 +56,17 @@ from agenthub.auto.tree import (
     get_routing_explanation,
     TreeNode,
 )
+from agenthub.auto.routing_index import (
+    RoutingIndex,
+    RoutingIndexBuilder,
+    IndexedKeywordRouter,
+    AgentRoutingMetadata,
+)
 
 if TYPE_CHECKING:
     from agenthub.hub import AgentHub
+
+from agenthub.models import AgentSpec
 
 
 def discover_all_agents(
@@ -160,7 +170,84 @@ def discover_all_agents(
         if factory._import_graph is not None:
             hub._import_graph = factory._import_graph
 
+        # Store project root on hub for dashboard access
+        hub._project_root = str(Path(project_root).resolve())
+
         summary_parts.append(f"\nTier B agents created: {tier_b_count}")
+
+        # Step 3: Create sub-agents for large Tier B agents
+        sub_agent_count = 0
+        if factory._import_graph is not None:
+            from agenthub.auto.sub_agent_manager import SubAgentManager
+            from agenthub.auto.sub_agent_policy import SubAgentPolicy
+            import json
+
+            # Load policy settings from config file (set via dashboard)
+            policy_config = {
+                "min_files_to_split": 40,
+                "min_subdirs_to_split": 2,
+                "min_files_per_sub": 8,
+                "max_sub_agents": 6,
+            }
+            try:
+                config_file = Path.home() / ".agenthub" / "sub_agent_policy.json"
+                if config_file.exists():
+                    saved = json.loads(config_file.read_text())
+                    policy_config.update(saved)
+            except Exception:
+                pass  # Use defaults if loading fails
+
+            policy = SubAgentPolicy(
+                min_files_to_split=policy_config["min_files_to_split"],
+                min_subdirs_to_split=policy_config["min_subdirs_to_split"],
+                min_files_per_sub=policy_config["min_files_per_sub"],
+                max_sub_agents=policy_config["max_sub_agents"],
+            )
+
+            for agent in agents:
+                if policy.should_subdivide(agent, factory._import_graph):
+                    boundaries = policy.propose_subdivisions(agent, factory._import_graph)
+                    for boundary in boundaries:
+                        try:
+                            from agenthub.auto.sub_agent_manager import SubCodeAgent
+
+                            # Extract name from sub_agent_id (e.g., "backend_api" -> "Backend Api")
+                            sub_name = boundary.sub_agent_id.replace("_", " ").title()
+
+                            # Extract keywords from root_path and key_modules
+                            keywords = []
+                            if boundary.root_path:
+                                keywords.extend(boundary.root_path.split("/"))
+                            keywords.extend([Path(m).stem for m in boundary.key_modules[:3]])
+
+                            sub_spec = AgentSpec(
+                                agent_id=boundary.sub_agent_id,
+                                name=f"{sub_name} Expert",
+                                description=boundary.role_description or f"Expert on {boundary.root_path}",
+                                context_keywords=keywords,
+                                context_paths=boundary.include_patterns or [f"{boundary.root_path}/**/*.py"],
+                                max_context_size=config.max_agent_context_kb * 1024 if config else 80 * 1024,
+                                metadata={
+                                    "tier": "B",
+                                    "auto_generated": True,
+                                    "parent_agent": agent.spec.agent_id,
+                                    "is_sub_agent": True,
+                                },
+                            )
+                            sub_agent = SubCodeAgent(
+                                sub_spec,
+                                client,
+                                boundary.root_path,
+                                boundary.include_patterns,
+                                agent.spec.agent_id,
+                            )
+                            hub.register(sub_agent)
+                            sub_agent_count += 1
+                        except Exception:
+                            pass  # Skip failed sub-agents
+
+            if sub_agent_count > 0:
+                summary_parts.append(f"Sub-agents created: {sub_agent_count}")
 
     # Summary header
     total = tier_a_count + tier_b_count
@@ -168,12 +255,37 @@ def discover_all_agents(
     summary_parts.insert(1, "=" * 40)
 
     # Add agent tree visualization
-    from pathlib import Path
     project_name = Path(project_root).name
     summary_parts.append("")
     summary_parts.append("Agent Coverage Tree:")
     summary_parts.append("-" * 40)
     summary_parts.append(print_agent_tree(hub, project_name))
+
+    # Step 4: Build and store routing index for fast query-time routing
+    # This is done at setup time so queries don't pay the indexing cost
+    try:
+        all_agent_specs = hub.list_agents()
+        if all_agent_specs:
+            index_builder = RoutingIndexBuilder(project_root)
+
+            # Try to load cached index first
+            cached_index = index_builder.load()
+            if cached_index and cached_index.agent_count == len(all_agent_specs):
+                # Cache is valid - use it
+                hub._routing_index = cached_index
+                summary_parts.append("")
+                summary_parts.append(f"Routing index loaded from cache ({len(all_agent_specs)} agents)")
+            else:
+                # Build fresh index
+                routing_index = index_builder.build(all_agent_specs)
+                hub._routing_index = routing_index
+
+                # Save to cache for next time
+                cache_path = index_builder.save(routing_index)
+                summary_parts.append("")
+                summary_parts.append(f"Routing index built ({len(all_agent_specs)} agents, {len(routing_index.keyword_to_agents)} keywords)")
+    except Exception as e:
+        summary_parts.append(f"Routing index build warning: {e}")
 
     return hub, "\n".join(summary_parts)
 
@@ -325,4 +437,9 @@ __all__ = [
     "CrossContextConfig",
     "InjectedContext",
     "format_injected_context",
+    # Routing index (pre-computed at setup time)
+    "RoutingIndex",
+    "RoutingIndexBuilder",
+    "IndexedKeywordRouter",
+    "AgentRoutingMetadata",
 ]

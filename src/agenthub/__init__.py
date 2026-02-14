@@ -1,3 +1,4 @@
+from __future__ import annotations
 """AgentHub: Lightweight agent orchestration for context-efficient LLM applications.
 
 AgentHub lets you build and orchestrate specialized AI agents that maintain

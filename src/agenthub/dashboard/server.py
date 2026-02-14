@@ -70,19 +70,82 @@ def create_dashboard_app(hub, observer: Optional[ConversationObserver] = None):
         """Get all registered agents."""
         agents = []
         for spec in _hub.list_agents():
+            # Determine tier: check explicit tier metadata first
+            explicit_tier = spec.metadata.get("tier")
+            if explicit_tier in ("A", "B", "C"):
+                tier = explicit_tier
+            elif spec.metadata.get("auto_generated"):
+                tier = "B"
+            else:
+                tier = "A"
+
             agent_data = {
                 "id": spec.agent_id,
                 "name": spec.name,
                 "description": spec.description,
-                "tier": "B" if spec.metadata.get("auto_generated") else "A",
+                "tier": tier,
                 "module_type": spec.metadata.get("module_type", "custom"),
-                "keywords": spec.context_keywords[:10],
+                "keywords": spec.context_keywords[:10] if spec.context_keywords else [],
+                "role": spec.metadata.get("role", ""),
             }
             # Include R&R if available (Tier B agents)
             if "rnr" in spec.metadata:
                 agent_data["rnr"] = spec.metadata["rnr"]
             agents.append(agent_data)
         return {"agents": agents}
+
+    @app.get("/api/debug")
+    async def get_debug_info():
+        """Debug info about the hub."""
+        from pathlib import Path
+        info = {
+            "has_project_root": hasattr(_hub, '_project_root') and _hub._project_root is not None,
+            "has_auto_manager": hasattr(_hub, '_auto_manager') and _hub._auto_manager is not None,
+        }
+        if info["has_project_root"]:
+            info["project_root"] = str(_hub._project_root)
+        if info["has_auto_manager"]:
+            info["auto_manager_project_root"] = str(getattr(_hub._auto_manager, 'project_root', None))
+        return info
+
+    @app.get("/api/agent-status")
+    async def get_agent_statuses():
+        """Get context awareness status for all agents.
+
+        Returns staleness info showing whether each agent has seen
+        recent file changes in their domain.
+        """
+        statuses = _hub.get_all_agent_context_statuses()
+        return {
+            "statuses": [
+                {
+                    "agent_id": s.agent_id,
+                    "is_stale": s.is_stale,
+                    "status": s.status,
+                    "changed_files": s.changed_files[:5],  # Limit to 5 files
+                    "changed_file_count": len(s.changed_files),
+                    "last_query_time": s.last_query_time.isoformat() if s.last_query_time else None,
+                    "last_change_time": s.last_change_time.isoformat() if s.last_change_time else None,
+                }
+                for s in statuses
+            ]
+        }
+
+    @app.get("/api/agent-status/{agent_id}")
+    async def get_agent_status(agent_id: str):
+        """Get context awareness status for a specific agent."""
+        status = _hub.get_agent_context_status(agent_id)
+        if not status:
+            return {"error": "Agent not found or file watching not enabled"}
+
+        return {
+            "agent_id": status.agent_id,
+            "is_stale": status.is_stale,
+            "status": status.status,
+            "changed_files": status.changed_files,
+            "last_query_time": status.last_query_time.isoformat() if status.last_query_time else None,
+            "last_change_time": status.last_change_time.isoformat() if status.last_change_time else None,
+        }
 
     @app.get("/api/agents/{agent_id}/rnr")
     async def get_agent_rnr(agent_id: str):
@@ -94,11 +157,20 @@ def create_dashboard_app(hub, observer: Optional[ConversationObserver] = None):
         spec = agent.spec
         rnr = spec.metadata.get("rnr")
 
+        # Determine tier
+        explicit_tier = spec.metadata.get("tier")
+        if explicit_tier in ("A", "B", "C"):
+            tier = explicit_tier
+        elif spec.metadata.get("auto_generated"):
+            tier = "B"
+        else:
+            tier = "A"
+
         if not rnr:
             return {
                 "agent_id": agent_id,
-                "tier": "A" if not spec.metadata.get("auto_generated") else "B",
-                "message": "This is a Tier A agent. R&R is defined by the agent creator.",
+                "tier": tier,
+                "message": f"This is a Tier {tier} agent. R&R is defined by the agent creator.",
             }
 
         return {
@@ -120,6 +192,89 @@ def create_dashboard_app(hub, observer: Optional[ConversationObserver] = None):
         """Get agent statistics."""
         return {"stats": _observer.get_agent_stats()}
 
+    # =========================================================================
+    # DAG Team Execution Endpoints
+    # =========================================================================
+
+    @app.get("/api/team-traces")
+    async def get_team_traces(limit: int = 20):
+        """Get recent team execution traces.
+
+        Returns a list of team execution traces for DAG visualization.
+        """
+        traces = _hub.get_team_traces(limit=limit)
+        return {
+            "traces": [
+                {
+                    "session_id": t["session_id"],
+                    "query": t["query"],
+                    "timestamp": t["timestamp"],
+                    "agents_used": list(t["trace"].get("agent_responses", {}).keys()),
+                    "total_tokens": t["trace"].get("total_tokens", 0),
+                    "total_time_ms": t["trace"].get("total_time_ms", 0),
+                    "layer_count": len(t["trace"].get("execution_layers", [])),
+                }
+                for t in traces
+            ]
+        }
+
+    @app.get("/api/team-trace/{session_id}")
+    async def get_team_trace(session_id: str):
+        """Get a specific team execution trace with full details.
+
+        Returns complete trace data including DAG structure, sub-questions,
+        and individual agent responses for visualization.
+        """
+        trace_data = _hub.get_team_trace(session_id)
+        if not trace_data:
+            return {"error": f"Trace '{session_id}' not found"}
+
+        trace = trace_data["trace"]
+
+        # Build nodes with status and position info for visualization
+        nodes = []
+        execution_layers = trace.get("execution_layers", [])
+        sub_questions = trace.get("sub_questions", {})
+        agent_responses = trace.get("agent_responses", {})
+        agent_tokens = trace.get("agent_tokens", {})
+        agent_times = trace.get("agent_times", {})
+
+        for layer_idx, layer in enumerate(execution_layers):
+            for node_idx, agent_id in enumerate(layer):
+                nodes.append({
+                    "id": agent_id,
+                    "layer": layer_idx,
+                    "position": node_idx,
+                    "sub_question": sub_questions.get(agent_id, ""),
+                    "response": agent_responses.get(agent_id, ""),
+                    "tokens": agent_tokens.get(agent_id, 0),
+                    "time_ms": agent_times.get(agent_id, 0),
+                    "status": "done" if agent_id in agent_responses else "pending",
+                })
+
+        # Build edges from dag_structure (dependencies)
+        edges = []
+        dag_structure = trace.get("dag_structure", {})
+        for agent_id, deps in dag_structure.items():
+            for dep in deps:
+                edges.append({"from": dep, "to": agent_id})
+
+        return {
+            "session_id": trace_data["session_id"],
+            "query": trace_data["query"],
+            "timestamp": trace_data["timestamp"],
+            "nodes": nodes,
+            "edges": edges,
+            "execution_layers": execution_layers,
+            "summary": {
+                "total_tokens": trace.get("total_tokens", 0),
+                "decomposition_tokens": trace.get("decomposition_tokens", 0),
+                "synthesis_tokens": trace.get("synthesis_tokens", 0),
+                "total_time_ms": trace.get("total_time_ms", 0),
+                "parallel_speedup": trace.get("parallel_speedup", 1.0),
+            },
+        }
+
     @app.get("/api/routing-rules")
     async def get_routing_rules():
         """Get routing rules showing which keywords map to which agents.
@@ -128,44 +283,54 @@ def create_dashboard_app(hub, observer: Optional[ConversationObserver] = None):
         """
         rules = []
         for spec in _hub.list_agents():
+            # Determine tier
+            explicit_tier = spec.metadata.get("tier")
+            if explicit_tier in ("A", "B", "C"):
+                tier = explicit_tier
+            elif spec.metadata.get("auto_generated"):
+                tier = "B"
+            else:
+                tier = "A"
+
+            # Priority: A=1, B=2, C=3 (meta-agents checked last)
+            priority_map = {"A": 1, "B": 2, "C": 3}
             agent_info = {
                 "agent_id": spec.agent_id,
                 "agent_name": spec.name,
-                "tier": "B" if spec.metadata.get("auto_generated") else "A",
-                "keywords": spec.context_keywords,
+                "tier": tier,
+                "keywords": spec.context_keywords or [],
                 "description": spec.description,
-                "priority": 1 if not spec.metadata.get("auto_generated") else 2,  # Tier A first
+                "priority": priority_map.get(tier, 2),
             }
             rules.append(agent_info)
 
-        # Sort by priority (Tier A first), then by number of keywords
+        # Sort by priority (Tier A first, then B, then C), then by number of keywords
         rules.sort(key=lambda r: (r["priority"], -len(r["keywords"])))
 
         return {
             "rules": rules,
             "routing_strategy": "keyword_match",
-            "explanation": "Queries are matched against agent keywords. Tier A agents are checked first, then Tier B. First match wins.",
+            "explanation": "Queries are matched against agent keywords. Tier A agents are checked first, then Tier B, then Tier C (meta-agents). First match wins.",
         }
 
     @app.get("/api/tree")
     async def get_agent_tree():
         """Get the agent tree visualization.
 
-        Returns the ASCII tree showing agent hierarchy and coverage.
+        Returns the ASCII tree showing agent hierarchy and coverage,
+        plus structured agent data for card-based visualization.
         """
         from agenthub.auto.tree import build_agent_tree, print_agent_tree
+        from pathlib import Path
 
-        # Try to get project name from first agent's context paths
+        # Get project name from the hub's project root
         project_name = "Project"
-        for spec in _hub.list_agents():
-            if spec.context_paths:
-                from pathlib import Path
-                # Get the root directory from context paths
-                first_path = spec.context_paths[0]
-                parts = Path(first_path).parts
-                if parts:
-                    project_name = parts[0]
-                    break
+        if hasattr(_hub, '_project_root') and _hub._project_root:
+            project_name = Path(_hub._project_root).name
+        elif hasattr(_hub, '_auto_manager') and _hub._auto_manager:
+            auto_project_root = getattr(_hub._auto_manager, 'project_root', None)
+            if auto_project_root:
+                project_name = Path(auto_project_root).name
 
         tree_text = print_agent_tree(_hub, project_name, use_ascii=True)
 
@@ -181,9 +346,53 @@ def create_dashboard_app(hub, observer: Optional[ConversationObserver] = None):
                 "children": [node_to_dict(c) for c in node.children],
             }
 
+        # Build structured agent list for card view
+        agents_structured = {
+            "project_name": project_name,
+            "tier_a": [],
+            "tier_b": [],
+            "tier_c": [],
+            "sub_agents": [],
+        }
+
+        for spec in _hub.list_agents():
+            tier = spec.metadata.get("tier", "")
+            is_sub = spec.metadata.get("is_sub_agent", False)
+            parent = spec.metadata.get("parent_agent", "")
+
+            # Count files in context paths
+            file_count = 0
+            if spec.context_paths:
+                for ctx in spec.context_paths:
+                    if "**" in ctx:
+                        # Glob pattern - estimate based on pattern
+                        file_count += 10  # rough estimate
+                    else:
+                        file_count += 1
+
+            agent_data = {
+                "id": spec.agent_id,
+                "name": spec.name,
+                "description": spec.description or "",
+                "keywords": spec.context_keywords[:5] if spec.context_keywords else [],
+                "file_count": file_count,
+                "context_paths": spec.context_paths[:3] if spec.context_paths else [],
+            }
+
+            if is_sub:
+                agent_data["parent"] = parent
+                agents_structured["sub_agents"].append(agent_data)
+            elif tier == "A":
+                agents_structured["tier_a"].append(agent_data)
+            elif tier == "B":
+                agents_structured["tier_b"].append(agent_data)
+            elif tier == "C":
+                agents_structured["tier_c"].append(agent_data)
+
         return {
             "ascii": tree_text,
             "tree": node_to_dict(tree_node),
+            "agents": agents_structured,
         }
 
     @app.post("/api/query")
@@ -211,18 +420,18 @@ def create_dashboard_app(hub, observer: Optional[ConversationObserver] = None):
         """Log a Claude Code activity event.
 
         This endpoint allows Claude Code to send events that appear
-        in the dashboard's Live Events panel.
+        in the dashboard's Live Events panel AND Recent Conversations.
 
         Expected data:
-            event_type: One of claude_code_task, claude_code_search,
-                       claude_code_read, claude_code_edit, claude_code_result
+            event_type: One of task, result, search, read, edit, etc.
             session_id: Optional session identifier
             description: Human-readable description
             details: Optional dict with additional data
+                - For 'result' events: agent_id, tokens_used, query, response
         """
         from datetime import datetime
         from uuid import uuid4
-        from agenthub.dashboard.observer import ConversationEvent, EventType
+        from agenthub.dashboard.observer import ConversationEvent, ConversationTrace, EventType
 
         event_type_str = data.get("event_type", "claude_code_task")
         session_id = data.get("session_id", str(uuid4())[:8])
@@ -239,8 +448,19 @@ def create_dashboard_app(hub, observer: Optional[ConversationObserver] = None):
             "context_refresh": EventType.CONTEXT_REFRESH,
             "git_change": EventType.GIT_CHANGE_DETECTED,
             "file_change": EventType.FILE_CHANGE_DETECTED,
+            # Benchmark lifecycle events — mapped to CLAUDE_CODE_TASK
+            # (generic enough to display; the event_type_str is preserved in data)
+            "benchmark_started": EventType.CLAUDE_CODE_TASK,
+            "benchmark_completed": EventType.CLAUDE_CODE_RESULT,
+            "benchmark_repo_started": EventType.CLAUDE_CODE_TASK,
+            "benchmark_repo_completed": EventType.CLAUDE_CODE_RESULT,
+            "benchmark_task_started": EventType.CLAUDE_CODE_TASK,
+            "benchmark_task_completed": EventType.CLAUDE_CODE_RESULT,
         }
         event_type = event_map.get(event_type_str, EventType.CLAUDE_CODE_TASK)
+
+        # Preserve the original event_type_str for the frontend to differentiate
+        details["_event_type"] = event_type_str
 
         # Create and broadcast event
         event = ConversationEvent(
@@ -257,6 +477,27 @@ def create_dashboard_app(hub, observer: Optional[ConversationObserver] = None):
                 asyncio.create_task(client.send_text(message))
             except Exception:
                 _websocket_clients.remove(client)
+
+        # For 'result' events, also create a trace for Recent Conversations
+        if event_type_str == "result" and _observer:
+            query = details.get("query", "")
+            agent_id = details.get("agent_id", "unknown")
+            tokens_used = details.get("tokens_used", 0)
+            response_content = details.get("response", "")
+            team_execution = details.get("team_execution", False)
+
+            # Create a completed trace
+            trace = ConversationTrace(
+                session_id=session_id,
+                query=query[:200] if query else description[:200],
+                started_at=datetime.now(),
+                completed_at=datetime.now(),
+                final_agent="team" if team_execution else agent_id,
+                final_response=response_content[:500] if response_content else "",
+                tokens_used=tokens_used,
+            )
+            trace.events.append(event)
+            _observer._store_trace(trace)
 
         return {"status": "ok", "event_type": event_type.value, "session_id": session_id}
 
@@ -554,6 +795,161 @@ def create_dashboard_app(hub, observer: Optional[ConversationObserver] = None):
         except Exception as e:
             return {"error": str(e)}
 
+    @app.post("/api/qc/concerns-scan")
+    async def scan_tier_b_concerns():
+        """Scan all Tier B agents for code concerns.
+
+        Each Tier B agent is queried with: "Do you have any concerns about
+        the code in your domain? Report issues with severity levels."
+
+        Returns:
+            List of concerns grouped by agent with severity.
+        """
+        import asyncio
+        from concurrent.futures import ThreadPoolExecutor
+
+        # Get all Tier B agents
+        tier_b_agents = []
+        for spec in _hub.list_agents():
+            if spec.metadata.get("tier") == "B":
+                agent = _hub.get_agent(spec.agent_id)
+                if agent:
+                    tier_b_agents.append(agent)
+
+        if not tier_b_agents:
+            return {"concerns": [], "message": "No Tier B agents found"}
+
+        # Query prompt for concerns
+        concerns_prompt = """Analyze the code in your domain and identify any concerns.
+For each concern, provide:
+1. **Severity**: CRITICAL, HIGH, MEDIUM, or LOW
+2. **Title**: Brief description (one line)
+3. **File**: The file path if applicable
+4. **Details**: Why this is a concern
+
+Focus on:
+- Security vulnerabilities
+- Performance issues
+- Code quality problems
+- Missing error handling
+- Deprecated patterns
+- Potential bugs
+
+Format your response as a list of concerns. If no concerns, say "No concerns found."
+"""
+
+        results = []
+        errors = []
+
+        # Query each agent
+        def query_agent(agent):
+            try:
+                response = agent.run(concerns_prompt)
+                return {
+                    "agent_id": agent.spec.agent_id,
+                    "agent_name": agent.spec.name,
+                    "response": response.content if hasattr(response, "content") else str(response),
+                }
+            except Exception as e:
+                return {
+                    "agent_id": agent.spec.agent_id,
+                    "agent_name": agent.spec.name,
+                    "error": str(e),
+                }
+
+        # Run queries in parallel using thread pool
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = [executor.submit(query_agent, agent) for agent in tier_b_agents]
+            for future in futures:
+                result = future.result()
+                if "error" in result:
+                    errors.append(result)
+                else:
+                    results.append(result)
+
+        # Parse concerns from responses
+        all_concerns = []
+        for result in results:
+            agent_concerns = _parse_agent_concerns(
+                result["response"],
+                result["agent_id"],
+                result["agent_name"]
+            )
+            all_concerns.extend(agent_concerns)
+
+        # Sort by severity
+        severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+        all_concerns.sort(key=lambda c: severity_order.get(c.get("severity", "LOW"), 4))
+
+        return {
+            "concerns": all_concerns,
+            "agents_queried": len(tier_b_agents),
+            "agents_responded": len(results),
+            "errors": errors,
+        }
+
+    def _parse_agent_concerns(response: str, agent_id: str, agent_name: str) -> list:
+        """Parse concerns from agent response."""
+        concerns = []
+
+        # Check for "no concerns" response
+        lower_resp = response.lower()
+        if "no concerns" in lower_resp or "no issues" in lower_resp:
+            return concerns
+
+        # Parse severity markers
+        lines = response.split("\n")
+        current_concern = None
+
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+
+            # Check for severity markers
+            upper_line = line.upper()
+            severity = None
+            for sev in ["CRITICAL", "HIGH", "MEDIUM", "LOW"]:
+                if sev in upper_line:
+                    severity = sev
+                    break
+
+            if severity:
+                # Save previous concern
+                if current_concern:
+                    concerns.append(current_concern)
+
+                # Start new concern
+                # Clean up the line - remove markdown, bullets, etc.
+                title = line
+                for prefix in ["**", "- ", "* ", "• ", "1.", "2.", "3.", "4.", "5.", "6.", "7.", "8.", "9."]:
+                    title = title.replace(prefix, "")
+                for sev in ["CRITICAL:", "HIGH:", "MEDIUM:", "LOW:", "CRITICAL", "HIGH", "MEDIUM", "LOW"]:
+                    title = title.replace(sev, "").replace(sev.lower(), "").replace(sev.title(), "")
+                title = title.strip(" -:*")
+
+                current_concern = {
+                    "severity": severity,
+                    "title": title if title else f"Issue in {agent_name}",
+                    "agent_id": agent_id,
+                    "agent_name": agent_name,
+                    "file": "",
+                    "details": "",
+                }
+            elif current_concern:
+                # Add to details
+                if "file:" in line.lower() or ".py" in line:
+                    # Extract file path
+                    current_concern["file"] = line.replace("File:", "").replace("**File**:", "").strip()
+                else:
+                    current_concern["details"] += line + " "
+
+        # Don't forget last concern
+        if current_concern:
+            concerns.append(current_concern)
+
+        return concerns
+
     @app.get("/api/files")
     async def list_project_files(extensions: str = ".py", max_files: int = 500):
         """List project files for QC analysis selection.
@@ -641,6 +1037,137 @@ def create_dashboard_app(hub, observer: Optional[ConversationObserver] = None):
             "directories": result,
         }
 
+    # =========================================================================
+    # Sub-Agent Policy Configuration
+    # =========================================================================
+
+    # In-memory storage for sub-agent policy (persisted via config file)
+    _sub_agent_policy = {
+        "min_files_to_split": 40,
+        "min_subdirs_to_split": 2,
+        "min_files_per_sub": 8,
+        "max_sub_agents": 6,
+    }
+
+    @app.get("/api/config/sub-agent-policy")
+    async def get_sub_agent_policy():
+        """Get current sub-agent policy configuration."""
+        return {
+            "policy": _sub_agent_policy,
+            "description": {
+                "min_files_to_split": "Minimum files an agent must have to be considered for subdivision",
+                "min_subdirs_to_split": "Minimum distinct subdirectories required for subdivision",
+                "min_files_per_sub": "Minimum files each sub-agent must have (prevents over-splitting)",
+                "max_sub_agents": "Maximum number of sub-agents to create from a single agent",
+            },
+        }
+
+    @app.post("/api/config/sub-agent-policy")
+    async def update_sub_agent_policy(policy: dict):
+        """Update sub-agent policy configuration.
+
+        Args:
+            policy: Dict with policy fields to update.
+
+        Returns:
+            Updated policy configuration.
+        """
+        nonlocal _sub_agent_policy
+
+        # Validate and update fields
+        valid_fields = {"min_files_to_split", "min_subdirs_to_split", "min_files_per_sub", "max_sub_agents"}
+        updates = {}
+
+        for key, value in policy.items():
+            if key in valid_fields:
+                if not isinstance(value, int) or value < 1:
+                    return {"error": f"Invalid value for {key}: must be a positive integer"}
+                updates[key] = value
+
+        if not updates:
+            return {"error": "No valid fields to update"}
+
+        _sub_agent_policy.update(updates)
+
+        # Try to persist to config file
+        try:
+            from pathlib import Path
+            config_file = Path.home() / ".agenthub" / "sub_agent_policy.json"
+            config_file.parent.mkdir(exist_ok=True)
+            config_file.write_text(json.dumps(_sub_agent_policy, indent=2))
+        except Exception:
+            pass  # Non-critical if persistence fails
+
+        return {
+            "status": "updated",
+            "policy": _sub_agent_policy,
+        }
+
+    @app.post("/api/agents/refresh-keywords")
+    async def refresh_agent_keywords(agent_id: str = None):
+        """Refresh routing keywords for Tier B agents based on current code.
+
+        Keywords are re-extracted from:
+        - File/folder names in context_paths
+        - Class and function names in the code
+
+        This should be called after significant code changes to ensure
+        routing remains accurate.
+
+        Args:
+            agent_id: Optional specific agent to refresh. If None, refreshes all.
+
+        Returns:
+            Dict with updated keywords per agent.
+        """
+        try:
+            updated = _hub.refresh_agent_keywords(agent_id)
+
+            if not updated:
+                return {
+                    "status": "no_updates",
+                    "message": "No agents were updated. Ensure project_root is set and agents have context_paths.",
+                }
+
+            return {
+                "status": "updated",
+                "agents_updated": len(updated),
+                "keywords": updated,
+            }
+        except Exception as e:
+            return {
+                "status": "error",
+                "message": str(e),
+            }
+
+    @app.get("/api/agents/keywords")
+    async def get_agent_keywords():
+        """Get current routing keywords for all agents.
+
+        Returns:
+            Dict mapping agent_id to keywords list.
+        """
+        keywords = {}
+        for spec in _hub.list_agents():
+            keywords[spec.agent_id] = {
+                "name": spec.name,
+                "tier": spec.metadata.get("tier", "A" if not spec.metadata.get("auto_generated") else "B"),
+                "is_sub_agent": spec.metadata.get("is_sub_agent", False),
+                "keywords": spec.context_keywords,
+                "context_paths_count": len(spec.context_paths),
+            }
+        return {"agents": keywords}
+
+    # Load persisted policy on startup
+    try:
+        from pathlib import Path
+        config_file = Path.home() / ".agenthub" / "sub_agent_policy.json"
+        if config_file.exists():
+            saved = json.loads(config_file.read_text())
+            _sub_agent_policy.update(saved)
+    except Exception:
+        pass  # Use defaults if loading fails
+
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket):
         """WebSocket for real-time event streaming."""
@@ -702,6 +1229,7 @@ DASHBOARD_HTML = """
         }
         .tier-a { border-left: 4px solid #3b82f6; }
         .tier-b { border-left: 4px solid #10b981; }
+        .tier-c { border-left: 4px solid #8b5cf6; }
         .event-query { background: #fef3c7; }
         .event-routing { background: #dbeafe; }
         .event-agent { background: #d1fae5; }
@@ -716,6 +1244,193 @@ DASHBOARD_HTML = """
         #tree-ascii {
             line-height: 1.4;
             white-space: pre;
+        }
+        /* Org Chart Tree Styles */
+        .org-tree {
+            overflow-x: auto;
+            padding: 20px 10px;
+        }
+        .org-level {
+            display: flex;
+            justify-content: center;
+            gap: 16px;
+            margin-bottom: 24px;
+            position: relative;
+        }
+        .org-level::before {
+            content: '';
+            position: absolute;
+            top: -12px;
+            left: 50%;
+            transform: translateX(-50%);
+            height: 12px;
+            border-left: 2px solid #4b5563;
+        }
+        .org-level:first-child::before {
+            display: none;
+        }
+        .org-card {
+            background: linear-gradient(135deg, #1f2937 0%, #111827 100%);
+            border: 1px solid #374151;
+            border-radius: 12px;
+            padding: 12px 16px;
+            min-width: 180px;
+            max-width: 240px;
+            text-align: center;
+            position: relative;
+            transition: all 0.2s ease;
+            cursor: pointer;
+        }
+        .org-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 25px rgba(0, 0, 0, 0.3);
+            border-color: #6366f1;
+        }
+        .org-card.tier-a {
+            border-left: 4px solid #3b82f6;
+            background: linear-gradient(135deg, #1e3a5f 0%, #1e293b 100%);
+        }
+        .org-card.tier-b {
+            border-left: 4px solid #10b981;
+            background: linear-gradient(135deg, #134e4a 0%, #1e293b 100%);
+        }
+        .org-card.tier-c {
+            border-left: 4px solid #8b5cf6;
+            background: linear-gradient(135deg, #4c1d95 0%, #1e293b 100%);
+        }
+        .org-card.project {
+            border-left: 4px solid #f59e0b;
+            background: linear-gradient(135deg, #78350f 0%, #1e293b 100%);
+        }
+        .org-card-icon {
+            font-size: 24px;
+            margin-bottom: 6px;
+        }
+        .org-card-name {
+            font-weight: 600;
+            font-size: 13px;
+            margin-bottom: 4px;
+            color: #f3f4f6;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .org-card-desc {
+            font-size: 10px;
+            color: #9ca3af;
+            line-height: 1.3;
+            display: -webkit-box;
+            -webkit-line-clamp: 2;
+            -webkit-box-orient: vertical;
+            overflow: hidden;
+        }
+        .org-card-badge {
+            position: absolute;
+            top: -8px;
+            right: -8px;
+            background: #4b5563;
+            color: #e5e7eb;
+            font-size: 9px;
+            padding: 2px 6px;
+            border-radius: 10px;
+            font-weight: 500;
+        }
+        .org-card-badge.tier-a { background: #3b82f6; }
+        .org-card-badge.tier-b { background: #10b981; }
+        .org-card-badge.tier-c { background: #8b5cf6; }
+        .org-card-badge.sub { background: #a855f7; }
+        .org-card-files {
+            font-size: 9px;
+            color: #6b7280;
+            margin-top: 6px;
+        }
+        .org-connector {
+            position: relative;
+            height: 24px;
+        }
+        .org-connector::after {
+            content: '';
+            position: absolute;
+            left: 50%;
+            top: 0;
+            height: 100%;
+            border-left: 2px solid #4b5563;
+        }
+        .org-children {
+            display: flex;
+            justify-content: center;
+            gap: 12px;
+            flex-wrap: wrap;
+            position: relative;
+        }
+        .org-children::before {
+            content: '';
+            position: absolute;
+            top: -12px;
+            left: 10%;
+            right: 10%;
+            height: 0;
+            border-top: 2px solid #4b5563;
+        }
+        .org-group {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        .org-group-label {
+            font-size: 11px;
+            color: #9ca3af;
+            margin-bottom: 8px;
+            font-weight: 500;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .org-group-cards {
+            display: flex;
+            gap: 12px;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+        /* Parent agent with sub-agents container */
+        .org-parent-with-subs {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        .org-sub-connector {
+            position: relative;
+            height: 20px;
+            width: 2px;
+            background: #4b5563;
+        }
+        .org-sub-agents {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+            justify-content: center;
+            padding: 8px;
+            background: rgba(139, 92, 246, 0.1);
+            border-radius: 8px;
+            border: 1px dashed #8b5cf6;
+            position: relative;
+        }
+        .org-sub-agents::before {
+            content: '';
+            position: absolute;
+            top: -1px;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 0;
+            height: 0;
+            border-left: 6px solid transparent;
+            border-right: 6px solid transparent;
+            border-top: 6px solid #8b5cf6;
+        }
+        .org-card.sub-agent {
+            border-left: 4px solid #8b5cf6;
+            background: linear-gradient(135deg, #3b2e5a 0%, #1e293b 100%);
+            min-width: 140px;
+            max-width: 180px;
         }
         /* QC events - red/orange theme for concerns */
         .event-qc-started { background: #fef3c7; border-left: 3px solid #f59e0b; }
@@ -748,12 +1463,22 @@ DASHBOARD_HTML = """
                         <h2 class="text-lg font-semibold">🌳 Agent Coverage Tree</h2>
                         <span id="tree-toggle" class="text-gray-400">▼</span>
                     </div>
-                    <button onclick="loadTree()" class="text-xs bg-gray-700 hover:bg-gray-600 px-2 py-1 rounded">
-                        🔄 Refresh
-                    </button>
+                    <div class="flex items-center gap-2">
+                        <button onclick="toggleTreeView()" class="text-xs bg-gray-700 hover:bg-gray-600 px-2 py-1 rounded" id="tree-view-toggle">
+                            📊 Card View
+                        </button>
+                        <button onclick="loadTree()" class="text-xs bg-gray-700 hover:bg-gray-600 px-2 py-1 rounded">
+                            🔄 Refresh
+                        </button>
+                    </div>
                 </div>
                 <div id="tree-panel" class="mt-4">
-                    <pre id="tree-ascii" class="text-sm font-mono bg-gray-900 p-4 rounded overflow-x-auto text-gray-300">Loading...</pre>
+                    <!-- Card View (default) -->
+                    <div id="tree-cards" class="org-tree">
+                        <div class="text-gray-500 text-center py-8">Loading agents...</div>
+                    </div>
+                    <!-- ASCII View (hidden by default) -->
+                    <pre id="tree-ascii" class="text-sm font-mono bg-gray-900 p-4 rounded overflow-x-auto text-gray-300 hidden">Loading...</pre>
                 </div>
             </div>
         </div>
@@ -763,13 +1488,12 @@ DASHBOARD_HTML = """
             <div class="bg-gray-800 rounded-lg p-4">
                 <div class="flex items-center justify-between">
                     <div class="flex items-center gap-2 cursor-pointer" onclick="toggleQCPanel()">
-                        <h2 class="text-lg font-semibold">🔍 QC Analysis</h2>
+                        <h2 class="text-lg font-semibold">🔍 Code Concerns</h2>
                         <span id="qc-toggle" class="text-gray-400">▼</span>
-                        <span id="qc-status-badge" class="text-xs px-2 py-0.5 rounded bg-gray-700 text-gray-400">checking...</span>
                     </div>
                     <div class="flex items-center gap-2">
-                        <button id="qc-enable-btn" onclick="toggleQCEnabled()" class="text-xs bg-blue-600 hover:bg-blue-700 px-2 py-1 rounded">
-                            Enable
+                        <button id="run-qc-btn" onclick="runCodeConcernsAnalysis()" class="text-xs bg-purple-600 hover:bg-purple-700 px-3 py-1 rounded">
+                            🔍 Run Analysis
                         </button>
                         <button onclick="loadQCReports()" class="text-xs bg-gray-700 hover:bg-gray-600 px-2 py-1 rounded">
                             🔄 Refresh
@@ -777,23 +1501,17 @@ DASHBOARD_HTML = """
                     </div>
                 </div>
                 <div id="qc-panel" class="mt-4">
-                    <!-- File Selection & Manual Trigger -->
+                    <!-- Description -->
                     <div class="bg-gray-900 rounded p-3 mb-4">
-                        <div class="flex items-center justify-between mb-2">
-                            <h3 class="text-sm font-semibold text-gray-300">Manual Analysis</h3>
-                            <div class="flex gap-2">
-                                <button onclick="loadProjectFiles()" class="text-xs bg-gray-700 hover:bg-gray-600 px-2 py-1 rounded">
-                                    Load Files
-                                </button>
-                                <button id="analyze-btn" onclick="triggerQCAnalysis()" disabled class="text-xs bg-purple-600 hover:bg-purple-700 disabled:bg-gray-600 disabled:cursor-not-allowed px-3 py-1 rounded">
-                                    Analyze Selected
-                                </button>
+                        <p class="text-sm text-gray-400">
+                            Ask each Tier B agent: "Do you have any concerns for the latest updates or existing files?"
+                        </p>
+                        <div id="qc-progress" class="mt-2 hidden">
+                            <div class="flex items-center gap-2 text-sm text-blue-400">
+                                <span class="animate-spin">⏳</span>
+                                <span id="qc-progress-text">Analyzing...</span>
                             </div>
                         </div>
-                        <div id="file-picker" class="max-h-[200px] overflow-y-auto bg-gray-800 rounded p-2 text-xs">
-                            <div class="text-gray-500">Click "Load Files" to see project files</div>
-                        </div>
-                        <div id="selected-files-count" class="text-xs text-gray-400 mt-2">0 files selected</div>
                     </div>
 
                     <!-- QC Summary -->
@@ -816,7 +1534,7 @@ DASHBOARD_HTML = """
                         </div>
                     </div>
 
-                    <!-- Concerns Filter/Sort -->
+                    <!-- Concerns Filter -->
                     <div class="flex gap-2 mb-2">
                         <select id="qc-severity-filter" onchange="filterConcerns()" class="text-xs bg-gray-700 rounded px-2 py-1">
                             <option value="all">All Severities</option>
@@ -824,26 +1542,146 @@ DASHBOARD_HTML = """
                             <option value="high">High & Above</option>
                             <option value="medium">Medium & Above</option>
                         </select>
-                        <select id="qc-sort" onchange="filterConcerns()" class="text-xs bg-gray-700 rounded px-2 py-1">
-                            <option value="severity">Sort by Severity</option>
-                            <option value="time">Sort by Time</option>
-                            <option value="category">Sort by Category</option>
-                        </select>
                     </div>
 
-                    <!-- Recent Concerns -->
+                    <!-- Concerns by Agent -->
                     <div class="bg-gray-900 rounded p-3">
-                        <h3 class="text-sm font-semibold mb-2 text-gray-300">Recent Concerns</h3>
-                        <div id="qc-concerns-list" class="space-y-2 max-h-[300px] overflow-y-auto">
-                            <div class="text-gray-500 text-sm">No concerns yet</div>
+                        <h3 class="text-sm font-semibold mb-2 text-gray-300">Concerns by Agent</h3>
+                        <div id="qc-concerns-list" class="space-y-2 max-h-[400px] overflow-y-auto">
+                            <div class="text-gray-500 text-sm">Click "Run Analysis" to check for concerns</div>
                         </div>
                     </div>
+                </div>
+            </div>
+        </div>
 
-                    <!-- Recent Reports -->
-                    <div class="bg-gray-900 rounded p-3 mt-4">
-                        <h3 class="text-sm font-semibold mb-2 text-gray-300">Recent Reports</h3>
-                        <div id="qc-reports-list" class="space-y-2 max-h-[200px] overflow-y-auto">
-                            <div class="text-gray-500 text-sm">No reports yet</div>
+        <!-- DAG Team Execution Panel (Collapsible) -->
+        <div class="mb-6">
+            <div class="bg-gray-800 rounded-lg p-4">
+                <div class="flex items-center justify-between">
+                    <div class="flex items-center gap-2 cursor-pointer" onclick="toggleDAGPanel()">
+                        <h2 class="text-lg font-semibold">🔗 DAG Team Executions</h2>
+                        <span id="dag-toggle" class="text-gray-400">▶</span>
+                        <span id="dag-count-badge" class="text-xs px-2 py-0.5 rounded bg-gray-700 text-gray-400">0 traces</span>
+                    </div>
+                    <button onclick="loadTeamTraces()" class="text-xs bg-gray-700 hover:bg-gray-600 px-2 py-1 rounded">
+                        🔄 Refresh
+                    </button>
+                </div>
+                <div id="dag-panel" class="mt-4" style="display: none;">
+                    <!-- Trace List -->
+                    <div class="grid grid-cols-3 gap-4">
+                        <div class="col-span-1 bg-gray-900 rounded p-3">
+                            <h3 class="text-sm font-semibold mb-2 text-gray-300">Recent Team Queries</h3>
+                            <div id="dag-trace-list" class="space-y-2 max-h-[400px] overflow-y-auto">
+                                <div class="text-gray-500 text-sm">No team executions yet</div>
+                            </div>
+                        </div>
+                        <!-- DAG Visualization -->
+                        <div class="col-span-2 bg-gray-900 rounded p-3">
+                            <h3 class="text-sm font-semibold mb-2 text-gray-300">DAG Visualization</h3>
+                            <div id="dag-visualization" class="min-h-[300px] flex items-center justify-center">
+                                <div class="text-gray-500 text-sm">Select a trace to view DAG</div>
+                            </div>
+                            <!-- Node Detail -->
+                            <div id="dag-node-detail" class="mt-4 hidden">
+                                <div class="bg-gray-800 p-3 rounded">
+                                    <h4 class="text-sm font-semibold mb-2 text-purple-400" id="dag-node-title">Agent Details</h4>
+                                    <div class="space-y-2 text-sm">
+                                        <div><span class="text-gray-400">Sub-question:</span> <span id="dag-node-question" class="text-white"></span></div>
+                                        <div><span class="text-gray-400">Tokens:</span> <span id="dag-node-tokens" class="text-white"></span></div>
+                                        <div><span class="text-gray-400">Time:</span> <span id="dag-node-time" class="text-white"></span></div>
+                                        <details class="mt-2">
+                                            <summary class="cursor-pointer text-blue-400">View Response</summary>
+                                            <pre id="dag-node-response" class="mt-2 text-xs bg-gray-900 p-2 rounded whitespace-pre-wrap max-h-[200px] overflow-y-auto"></pre>
+                                        </details>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <!-- Summary Stats -->
+                    <div id="dag-summary" class="mt-4 grid grid-cols-5 gap-2 text-center text-xs hidden">
+                        <div class="bg-gray-900 p-2 rounded">
+                            <div id="dag-total-tokens" class="text-lg font-bold text-blue-400">-</div>
+                            <div class="text-gray-500">Total Tokens</div>
+                        </div>
+                        <div class="bg-gray-900 p-2 rounded">
+                            <div id="dag-decomp-tokens" class="text-lg font-bold text-purple-400">-</div>
+                            <div class="text-gray-500">Decomposition</div>
+                        </div>
+                        <div class="bg-gray-900 p-2 rounded">
+                            <div id="dag-synth-tokens" class="text-lg font-bold text-green-400">-</div>
+                            <div class="text-gray-500">Synthesis</div>
+                        </div>
+                        <div class="bg-gray-900 p-2 rounded">
+                            <div id="dag-total-time" class="text-lg font-bold text-yellow-400">-</div>
+                            <div class="text-gray-500">Total Time</div>
+                        </div>
+                        <div class="bg-gray-900 p-2 rounded">
+                            <div id="dag-speedup" class="text-lg font-bold text-orange-400">-</div>
+                            <div class="text-gray-500">Speedup</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Settings Panel (Collapsible) -->
+        <div class="mb-6">
+            <div class="bg-gray-800 rounded-lg p-4">
+                <div class="flex items-center justify-between">
+                    <div class="flex items-center gap-2 cursor-pointer" onclick="toggleSettingsPanel()">
+                        <h2 class="text-lg font-semibold">⚙️ Sub-Agent Settings</h2>
+                        <span id="settings-toggle" class="text-gray-400">▶</span>
+                    </div>
+                    <div class="flex items-center gap-2">
+                        <button onclick="loadSubAgentPolicy()" class="text-xs bg-gray-700 hover:bg-gray-600 px-2 py-1 rounded">
+                            🔄 Refresh
+                        </button>
+                        <button id="settings-save-btn" onclick="saveSubAgentPolicy()" class="text-xs bg-green-600 hover:bg-green-700 px-2 py-1 rounded">
+                            💾 Save
+                        </button>
+                    </div>
+                </div>
+                <div id="settings-panel" class="mt-4" style="display: none;">
+                    <div class="bg-gray-900 rounded p-4">
+                        <p class="text-sm text-gray-400 mb-4">
+                            Configure how large Tier B agents are subdivided into focused sub-agents.
+                            Sub-agents are created when an agent covers too many files, making it more efficient to have specialized team members.
+                        </p>
+                        <div class="grid grid-cols-2 gap-4">
+                            <!-- Min Files to Split -->
+                            <div class="bg-gray-800 p-3 rounded">
+                                <label class="text-sm font-medium text-gray-300 block mb-1">Min Files to Split</label>
+                                <input type="number" id="setting-min-files-to-split" min="10" max="200" value="40"
+                                    class="w-full bg-gray-700 text-white px-3 py-2 rounded text-sm border border-gray-600 focus:border-blue-500 focus:outline-none">
+                                <p class="text-xs text-gray-500 mt-1">Agent must have at least this many files to be considered for subdivision</p>
+                            </div>
+                            <!-- Min Subdirs to Split -->
+                            <div class="bg-gray-800 p-3 rounded">
+                                <label class="text-sm font-medium text-gray-300 block mb-1">Min Subdirectories</label>
+                                <input type="number" id="setting-min-subdirs-to-split" min="2" max="10" value="2"
+                                    class="w-full bg-gray-700 text-white px-3 py-2 rounded text-sm border border-gray-600 focus:border-blue-500 focus:outline-none">
+                                <p class="text-xs text-gray-500 mt-1">Must span at least this many distinct subdirectories</p>
+                            </div>
+                            <!-- Min Files Per Sub -->
+                            <div class="bg-gray-800 p-3 rounded">
+                                <label class="text-sm font-medium text-gray-300 block mb-1">Min Files Per Sub-Agent</label>
+                                <input type="number" id="setting-min-files-per-sub" min="3" max="50" value="8"
+                                    class="w-full bg-gray-700 text-white px-3 py-2 rounded text-sm border border-gray-600 focus:border-blue-500 focus:outline-none">
+                                <p class="text-xs text-gray-500 mt-1">Each sub-agent must have at least this many files (prevents over-splitting)</p>
+                            </div>
+                            <!-- Max Sub Agents -->
+                            <div class="bg-gray-800 p-3 rounded">
+                                <label class="text-sm font-medium text-gray-300 block mb-1">Max Sub-Agents</label>
+                                <input type="number" id="setting-max-sub-agents" min="2" max="12" value="6"
+                                    class="w-full bg-gray-700 text-white px-3 py-2 rounded text-sm border border-gray-600 focus:border-blue-500 focus:outline-none">
+                                <p class="text-xs text-gray-500 mt-1">Maximum number of sub-agents to create from a single Tier B agent</p>
+                            </div>
+                        </div>
+                        <div id="settings-status" class="mt-4 text-sm text-center hidden">
+                            <span class="text-green-400">✓ Settings saved successfully</span>
                         </div>
                     </div>
                 </div>
@@ -1030,25 +1868,40 @@ DASHBOARD_HTML = """
             btn.disabled = false;
         }
 
+        let treeViewMode = 'cards'; // 'cards' or 'ascii'
+
+        function toggleTreeView() {
+            const cardsEl = document.getElementById('tree-cards');
+            const asciiEl = document.getElementById('tree-ascii');
+            const toggleBtn = document.getElementById('tree-view-toggle');
+
+            if (treeViewMode === 'cards') {
+                treeViewMode = 'ascii';
+                cardsEl.classList.add('hidden');
+                asciiEl.classList.remove('hidden');
+                toggleBtn.textContent = '🎴 Card View';
+            } else {
+                treeViewMode = 'cards';
+                cardsEl.classList.remove('hidden');
+                asciiEl.classList.add('hidden');
+                toggleBtn.textContent = '📝 Text View';
+            }
+        }
+
         async function loadTree() {
             try {
                 const res = await fetch('/api/tree');
                 const data = await res.json();
-                const treeAscii = document.getElementById('tree-ascii');
 
-                // Add color highlighting to the tree
+                // Render ASCII view
+                const treeAscii = document.getElementById('tree-ascii');
                 let html = data.ascii
-                    // Project icon
                     .replace(/\\[P\\]/g, '<span class="text-yellow-400">[P]</span>')
-                    // Tier A icon
                     .replace(/\\[A\\]/g, '<span class="text-blue-400">[A]</span>')
-                    // Tier B icon
                     .replace(/\\[B\\]/g, '<span class="text-green-400">[B]</span>')
-                    // Agent icon
+                    .replace(/\\[C\\]/g, '<span class="text-purple-400">[C]</span>')
                     .replace(/\\* /g, '<span class="text-purple-400">◆ </span>')
-                    // Keywords icon
                     .replace(/# /g, '<span class="text-gray-500"># </span>')
-                    // Module type icons
                     .replace(/\\(api\\)/g, '<span class="text-orange-400">(api)</span>')
                     .replace(/\\(svc\\)/g, '<span class="text-pink-400">(svc)</span>')
                     .replace(/\\(mod\\)/g, '<span class="text-indigo-400">(mod)</span>')
@@ -1057,12 +1910,314 @@ DASHBOARD_HTML = """
                     .replace(/\\(cfg\\)/g, '<span class="text-rose-400">(cfg)</span>')
                     .replace(/\\(test\\)/g, '<span class="text-lime-400">(test)</span>')
                     .replace(/\\(code\\)/g, '<span class="text-slate-400">(code)</span>')
-                    // Description separator
+                    .replace(/\\(meta\\)/g, '<span class="text-purple-400">(meta)</span>')
                     .replace(/ --- /g, ' <span class="text-gray-500">―</span> ');
-
                 treeAscii.innerHTML = html;
+
+                // Render Card view using structured data
+                const treeCards = document.getElementById('tree-cards');
+                treeCards.innerHTML = renderTreeCards(data.agents);
+
             } catch (e) {
                 console.error('Failed to load tree:', e);
+            }
+        }
+
+        function renderTreeCards(agents) {
+            if (!agents) return '<div class="text-gray-500 text-center">No agents found</div>';
+
+            const { project_name, tier_a, tier_b, tier_c, sub_agents } = agents;
+            const totalAgents = (tier_a?.length || 0) + (tier_b?.length || 0) + (tier_c?.length || 0) + (sub_agents?.length || 0);
+
+            // Group sub-agents by parent
+            const subsByParent = {};
+            for (const sub of (sub_agents || [])) {
+                if (!subsByParent[sub.parent]) subsByParent[sub.parent] = [];
+                subsByParent[sub.parent].push(sub);
+            }
+
+            // Build HTML
+            let html = '';
+
+            // Project Card (top level)
+            html += `
+                <div class="org-level">
+                    <div class="org-card project">
+                        <div class="org-card-icon">📦</div>
+                        <div class="org-card-name">${escapeHtml(project_name)}</div>
+                        <div class="org-card-desc">${totalAgents} agents total</div>
+                    </div>
+                </div>
+            `;
+
+            // Connector
+            html += '<div class="org-connector"></div>';
+
+            // Tier A Group
+            if (tier_a && tier_a.length > 0) {
+                html += `
+                    <div class="org-group">
+                        <div class="org-group-label">🎯 TIER A - BUSINESS AGENTS (${tier_a.length})</div>
+                        <div class="org-group-cards">
+                `;
+                for (const agent of tier_a) {
+                    const shortName = agent.name.replace(/ Agent$/i, '').replace(/ Expert$/i, '');
+                    const keywords = agent.keywords?.join(', ') || '';
+                    html += `
+                        <div class="org-card tier-a" title="${escapeHtml(agent.description)}" onclick="showAgentDetails('${agent.id}')">
+                            <span class="org-card-badge tier-a">A</span>
+                            <div class="org-card-icon">💼</div>
+                            <div class="org-card-name">${escapeHtml(shortName)}</div>
+                            <div class="org-card-desc">${escapeHtml((agent.description || '').slice(0, 60))}${(agent.description || '').length > 60 ? '...' : ''}</div>
+                            ${keywords ? `<div class="org-card-files">🏷️ ${escapeHtml(keywords.slice(0, 30))}</div>` : ''}
+                        </div>
+                    `;
+                }
+                html += '</div></div>';
+            }
+
+            // Connector between Tier A and Tier B
+            html += '<div class="org-connector"></div>';
+
+            // Tier B Group with sub-agents nested
+            if (tier_b && tier_b.length > 0) {
+                html += `
+                    <div class="org-group">
+                        <div class="org-group-label">🔧 TIER B - CODE AGENTS (${tier_b.length})</div>
+                        <div class="org-group-cards">
+                `;
+                for (const agent of tier_b) {
+                    const shortName = agent.name.replace(/ Agent$/i, '').replace(/ Expert$/i, '');
+                    const subs = subsByParent[agent.id] || [];
+
+                    // Wrap parent + sub-agents in a container if there are sub-agents
+                    if (subs.length > 0) {
+                        html += `<div class="org-parent-with-subs">`;
+                    }
+
+                    html += `
+                        <div class="org-card tier-b" title="${escapeHtml(agent.description)}" onclick="showAgentDetails('${agent.id}')">
+                            <span class="org-card-badge tier-b">B</span>
+                            <div class="org-card-icon">⚙️</div>
+                            <div class="org-card-name">${escapeHtml(shortName)}</div>
+                            <div class="org-card-desc">${escapeHtml(agent.description.slice(0, 50))}${agent.description.length > 50 ? '...' : ''}</div>
+                            ${subs.length > 0 ? `<div class="org-card-files">👥 ${subs.length} sub-agents</div>` : ''}
+                        </div>
+                    `;
+
+                    // Render sub-agents underneath their parent
+                    if (subs.length > 0) {
+                        html += `<div class="org-sub-connector"></div>`;
+                        html += `<div class="org-sub-agents">`;
+                        for (const sub of subs) {
+                            const subShortName = sub.name.replace(/ Agent$/i, '').replace(/ Expert$/i, '');
+                            html += `
+                                <div class="org-card sub-agent" title="${escapeHtml(sub.description)}" onclick="showAgentDetails('${sub.id}')">
+                                    <span class="org-card-badge sub">Sub</span>
+                                    <div class="org-card-icon">🔹</div>
+                                    <div class="org-card-name">${escapeHtml(subShortName)}</div>
+                                    <div class="org-card-desc">${escapeHtml((sub.description || '').slice(0, 40))}${(sub.description || '').length > 40 ? '...' : ''}</div>
+                                    <div class="org-card-files">↑ ${escapeHtml(shortName)}</div>
+                                </div>
+                            `;
+                        }
+                        html += `</div></div>`; // close org-sub-agents and org-parent-with-subs
+                    }
+                }
+                html += '</div></div>';
+            }
+
+            // Tier C Group (Meta-Agents like QC)
+            if (tier_c && tier_c.length > 0) {
+                html += '<div class="org-connector"></div>';
+                html += `
+                    <div class="org-group">
+                        <div class="org-group-label">🔮 TIER C - META AGENTS (${tier_c.length})</div>
+                        <div class="org-group-cards">
+                `;
+                for (const agent of tier_c) {
+                    const shortName = agent.name.replace(/ Agent$/i, '').replace(/ Expert$/i, '');
+                    html += `
+                        <div class="org-card tier-c" title="${escapeHtml(agent.description)}" onclick="showAgentDetails('${agent.id}')">
+                            <span class="org-card-badge tier-c">C</span>
+                            <div class="org-card-icon">🔮</div>
+                            <div class="org-card-name">${escapeHtml(shortName)}</div>
+                            <div class="org-card-desc">${escapeHtml((agent.description || '').slice(0, 60))}${(agent.description || '').length > 60 ? '...' : ''}</div>
+                        </div>
+                    `;
+                }
+                html += '</div></div>';
+            }
+
+            return html;
+        }
+
+        function showAgentDetails(agentId) {
+            // Could open a modal with agent details, for now just log
+            console.log('Agent clicked:', agentId);
+            // Populate the query input with a suggestion
+            const queryInput = document.getElementById('query-input');
+            if (queryInput) {
+                queryInput.value = `Tell me about your responsibilities as the ${agentId} agent.`;
+                queryInput.focus();
+            }
+        }
+
+        function escapeHtml(text) {
+            if (!text) return '';
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        // =========================================================================
+        // Sub-Agent Settings Functions
+        // =========================================================================
+
+        let settingsPanelOpen = false;
+
+        function toggleSettingsPanel() {
+            settingsPanelOpen = !settingsPanelOpen;
+            const panel = document.getElementById('settings-panel');
+            const toggle = document.getElementById('settings-toggle');
+            panel.style.display = settingsPanelOpen ? 'block' : 'none';
+            toggle.textContent = settingsPanelOpen ? '▼' : '▶';
+            if (settingsPanelOpen) {
+                loadSubAgentPolicy();
+            }
+        }
+
+        async function loadSubAgentPolicy() {
+            try {
+                const res = await fetch('/api/config/sub-agent-policy');
+                const data = await res.json();
+
+                if (data.policy) {
+                    document.getElementById('setting-min-files-to-split').value = data.policy.min_files_to_split;
+                    document.getElementById('setting-min-subdirs-to-split').value = data.policy.min_subdirs_to_split;
+                    document.getElementById('setting-min-files-per-sub').value = data.policy.min_files_per_sub;
+                    document.getElementById('setting-max-sub-agents').value = data.policy.max_sub_agents;
+                }
+            } catch (e) {
+                console.error('Failed to load sub-agent policy:', e);
+            }
+        }
+
+        async function saveSubAgentPolicy() {
+            const policy = {
+                min_files_to_split: parseInt(document.getElementById('setting-min-files-to-split').value),
+                min_subdirs_to_split: parseInt(document.getElementById('setting-min-subdirs-to-split').value),
+                min_files_per_sub: parseInt(document.getElementById('setting-min-files-per-sub').value),
+                max_sub_agents: parseInt(document.getElementById('setting-max-sub-agents').value),
+            };
+
+            try {
+                const res = await fetch('/api/config/sub-agent-policy', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(policy),
+                });
+                const data = await res.json();
+
+                const statusEl = document.getElementById('settings-status');
+                if (data.error) {
+                    statusEl.innerHTML = `<span class="text-red-400">✗ Error: ${data.error}</span>`;
+                } else {
+                    statusEl.innerHTML = '<span class="text-green-400">✓ Settings saved! Restart dashboard to apply changes.</span>';
+                }
+                statusEl.classList.remove('hidden');
+
+                // Hide status after 3 seconds
+                setTimeout(() => {
+                    statusEl.classList.add('hidden');
+                }, 3000);
+            } catch (e) {
+                console.error('Failed to save sub-agent policy:', e);
+                const statusEl = document.getElementById('settings-status');
+                statusEl.innerHTML = `<span class="text-red-400">✗ Failed to save settings</span>`;
+                statusEl.classList.remove('hidden');
+            }
+        }
+
+        async function runCodeConcernsAnalysis() {
+            const btn = document.getElementById('run-qc-btn');
+            const originalText = btn.innerHTML;
+            btn.innerHTML = '⏳ Scanning...';
+            btn.disabled = true;
+
+            try {
+                const res = await fetch('/api/qc/concerns-scan', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                });
+                const data = await res.json();
+
+                if (data.error) {
+                    alert('Error: ' + data.error);
+                    return;
+                }
+
+                // Update counts
+                const concerns = data.concerns || [];
+                let critical = 0, high = 0, medium = 0, low = 0;
+                for (const c of concerns) {
+                    if (c.severity === 'CRITICAL') critical++;
+                    else if (c.severity === 'HIGH') high++;
+                    else if (c.severity === 'MEDIUM') medium++;
+                    else low++;
+                }
+
+                document.getElementById('qc-critical-count').textContent = critical;
+                document.getElementById('qc-high-count').textContent = high;
+                document.getElementById('qc-medium-count').textContent = medium;
+                document.getElementById('qc-low-count').textContent = low;
+
+                // Update concerns list
+                const concernsList = document.getElementById('qc-concerns-list');
+                if (concerns.length === 0) {
+                    concernsList.innerHTML = '<div class="text-gray-500 text-sm">✓ No concerns found from Tier B agents</div>';
+                } else {
+                    // Group by agent
+                    const byAgent = {};
+                    for (const c of concerns) {
+                        if (!byAgent[c.agent_name]) byAgent[c.agent_name] = [];
+                        byAgent[c.agent_name].push(c);
+                    }
+
+                    let html = '';
+                    for (const [agentName, agentConcerns] of Object.entries(byAgent)) {
+                        html += `<div class="mb-3">
+                            <div class="text-sm font-semibold text-blue-400 mb-1">📦 ${agentName}</div>`;
+                        for (const c of agentConcerns) {
+                            const severityColors = {
+                                'CRITICAL': 'bg-red-900 text-red-300',
+                                'HIGH': 'bg-orange-900 text-orange-300',
+                                'MEDIUM': 'bg-yellow-900 text-yellow-300',
+                                'LOW': 'bg-gray-700 text-gray-300'
+                            };
+                            const color = severityColors[c.severity] || severityColors['LOW'];
+                            html += `<div class="bg-gray-750 rounded p-2 mb-1 text-sm">
+                                <span class="px-1.5 py-0.5 rounded text-xs ${color}">${c.severity}</span>
+                                <span class="ml-2">${c.title}</span>
+                                ${c.file ? `<div class="text-gray-500 text-xs mt-1">📄 ${c.file}</div>` : ''}
+                                ${c.details ? `<div class="text-gray-400 text-xs mt-1">${c.details}</div>` : ''}
+                            </div>`;
+                        }
+                        html += '</div>';
+                    }
+                    concernsList.innerHTML = html;
+                }
+
+                // Show summary
+                const summary = `Scanned ${data.agents_queried} agents, found ${concerns.length} concerns`;
+                console.log(summary, data);
+
+            } catch (e) {
+                console.error('Failed to run concerns analysis:', e);
+                alert('Failed to run analysis: ' + e.message);
+            } finally {
+                btn.innerHTML = originalText;
+                btn.disabled = false;
             }
         }
 
@@ -1074,6 +2229,7 @@ DASHBOARD_HTML = """
             loadTree();
             loadQCStatus();
             loadQCReports();
+            loadSubAgentPolicy();
             connectWebSocket();
 
             document.getElementById('send-btn').addEventListener('click', sendQuery);
@@ -1560,7 +2716,88 @@ DASHBOARD_HTML = """
                     data.event_type === 'qc_report_complete') {
                     loadQCReports();
                 }
+
+                // Handle agent stale/fresh events
+                if (data.event_type === 'agent_stale' || data.event_type === 'agent_fresh') {
+                    loadAgentStatuses();
+                }
+
+                // Refresh agent statuses on file changes
+                if (data.event_type === 'file_change_detected') {
+                    loadAgentStatuses();
+                }
             };
+        }
+
+        let agentStatuses = {};
+
+        async function loadAgentStatuses() {
+            try {
+                const res = await fetch('/api/agent-status');
+                const data = await res.json();
+                agentStatuses = {};
+                for (const s of (data.statuses || [])) {
+                    agentStatuses[s.agent_id] = s;
+                }
+                // Re-render agents list with statuses
+                renderAgentsList();
+            } catch (e) {
+                console.error('Failed to load agent statuses:', e);
+            }
+        }
+
+        function getStatusIndicator(status) {
+            // status: "fresh" | "stale" | "never_queried"
+            if (status === 'fresh') {
+                return '<span class="w-2 h-2 rounded-full bg-green-500 inline-block" title="Up-to-date"></span>';
+            } else if (status === 'stale') {
+                return '<span class="w-2 h-2 rounded-full bg-yellow-500 inline-block" title="Has pending changes"></span>';
+            } else {
+                return '<span class="w-2 h-2 rounded-full bg-gray-500 inline-block" title="Never queried"></span>';
+            }
+        }
+
+        function renderAgentsList() {
+            const list = document.getElementById('agents-list');
+            const select = document.getElementById('agent-select');
+
+            const tierClass = (tier) => {
+                if (tier === 'A') return 'tier-a';
+                if (tier === 'B') return 'tier-b';
+                if (tier === 'C') return 'tier-c';
+                return 'tier-a';
+            };
+            const tierBgClass = (tier) => {
+                if (tier === 'A') return 'bg-blue-900';
+                if (tier === 'B') return 'bg-green-900';
+                if (tier === 'C') return 'bg-purple-900';
+                return 'bg-blue-900';
+            };
+
+            list.innerHTML = agents.map(a => {
+                const status = agentStatuses[a.id] || { status: 'never_queried' };
+                const statusIndicator = getStatusIndicator(status.status);
+                const changedCount = status.changed_file_count || 0;
+                const changedHint = changedCount > 0 ? ` (${changedCount} changed)` : '';
+
+                return `
+                <div class="p-2 rounded ${tierClass(a.tier)} bg-gray-700">
+                    <div class="flex items-center gap-2">
+                        ${statusIndicator}
+                        <span class="font-medium">${a.name}</span>
+                    </div>
+                    <div class="text-xs text-gray-400">${a.id}${changedHint}</div>
+                    <div class="text-xs mt-1">
+                        <span class="px-1 py-0.5 rounded ${tierBgClass(a.tier)}">
+                            Tier ${a.tier}
+                        </span>
+                        <span class="text-gray-500 ml-1">${a.module_type}${a.role ? ' · ' + a.role : ''}</span>
+                    </div>
+                </div>
+            `}).join('');
+
+            select.innerHTML = '<option value="">Auto-route</option>' +
+                agents.map(a => `<option value="${a.id}">${a.name} (${a.tier})</option>`).join('');
         }
 
         async function loadAgents() {
@@ -1568,24 +2805,8 @@ DASHBOARD_HTML = """
             const data = await res.json();
             agents = data.agents;
 
-            const list = document.getElementById('agents-list');
-            const select = document.getElementById('agent-select');
-
-            list.innerHTML = agents.map(a => `
-                <div class="p-2 rounded ${a.tier === 'A' ? 'tier-a' : 'tier-b'} bg-gray-700">
-                    <div class="font-medium">${a.name}</div>
-                    <div class="text-xs text-gray-400">${a.id}</div>
-                    <div class="text-xs mt-1">
-                        <span class="px-1 py-0.5 rounded ${a.tier === 'A' ? 'bg-blue-900' : 'bg-green-900'}">
-                            Tier ${a.tier}
-                        </span>
-                        <span class="text-gray-500 ml-1">${a.module_type}</span>
-                    </div>
-                </div>
-            `).join('');
-
-            select.innerHTML = '<option value="">Auto-route</option>' +
-                agents.map(a => `<option value="${a.id}">${a.name} (${a.tier})</option>`).join('');
+            // Also load statuses
+            await loadAgentStatuses();
         }
 
         async function loadTraces() {
@@ -1595,13 +2816,14 @@ DASHBOARD_HTML = """
             const tbody = document.getElementById('traces-body');
             tbody.innerHTML = data.traces.map(t => {
                 const agent = agents.find(a => a.id === t.final_agent) || {};
+                const tierBg = agent.tier === 'A' ? 'bg-blue-900' : agent.tier === 'C' ? 'bg-purple-900' : 'bg-green-900';
                 return `
                     <tr class="hover:bg-gray-700">
                         <td class="py-2">${new Date(t.started_at).toLocaleTimeString()}</td>
                         <td class="py-2 max-w-xs truncate">${t.query}</td>
                         <td class="py-2">${t.final_agent || '-'}</td>
                         <td class="py-2">
-                            <span class="px-1.5 py-0.5 rounded text-xs ${agent.tier === 'A' ? 'bg-blue-900' : 'bg-green-900'}">
+                            <span class="px-1.5 py-0.5 rounded text-xs ${tierBg}">
                                 ${agent.tier || '?'}
                             </span>
                         </td>
@@ -1645,11 +2867,14 @@ DASHBOARD_HTML = """
 
             let html = `<div class="text-xs text-gray-500 mb-2">${data.explanation}</div>`;
 
-            html += data.rules.map(rule => `
-                <div class="p-2 rounded bg-gray-700 ${rule.tier === 'A' ? 'tier-a' : 'tier-b'}">
+            html += data.rules.map(rule => {
+                const tierCls = rule.tier === 'A' ? 'tier-a' : rule.tier === 'C' ? 'tier-c' : 'tier-b';
+                const tierBg = rule.tier === 'A' ? 'bg-blue-900' : rule.tier === 'C' ? 'bg-purple-900' : 'bg-green-900';
+                return `
+                <div class="p-2 rounded bg-gray-700 ${tierCls}">
                     <div class="flex items-center gap-2">
                         <span class="font-medium text-sm">${rule.agent_name}</span>
-                        <span class="px-1 py-0.5 rounded text-xs ${rule.tier === 'A' ? 'bg-blue-900' : 'bg-green-900'}">
+                        <span class="px-1 py-0.5 rounded text-xs ${tierBg}">
                             Tier ${rule.tier}
                         </span>
                     </div>
@@ -1661,9 +2886,195 @@ DASHBOARD_HTML = """
                         ${rule.keywords.length > 8 ? `<span class="text-xs text-gray-500">+${rule.keywords.length - 8} more</span>` : ''}
                     </div>
                 </div>
-            `).join('');
+            `}).join('');
 
             panel.innerHTML = html;
+        }
+
+        // =========================================================================
+        // DAG Team Execution Functions
+        // =========================================================================
+
+        let dagPanelOpen = false;
+        let currentTraceData = null;
+
+        function toggleDAGPanel() {
+            dagPanelOpen = !dagPanelOpen;
+            const panel = document.getElementById('dag-panel');
+            const toggle = document.getElementById('dag-toggle');
+            panel.style.display = dagPanelOpen ? 'block' : 'none';
+            toggle.textContent = dagPanelOpen ? '▼' : '▶';
+            if (dagPanelOpen) {
+                loadTeamTraces();
+            }
+        }
+
+        async function loadTeamTraces() {
+            try {
+                const res = await fetch('/api/team-traces?limit=20');
+                const data = await res.json();
+
+                // Update count badge
+                const badge = document.getElementById('dag-count-badge');
+                badge.textContent = `${data.traces.length} traces`;
+
+                // Render trace list
+                const list = document.getElementById('dag-trace-list');
+                if (!data.traces || data.traces.length === 0) {
+                    list.innerHTML = '<div class="text-gray-500 text-sm">No team executions yet</div>';
+                    return;
+                }
+
+                list.innerHTML = data.traces.map(t => `
+                    <div class="p-2 rounded bg-gray-800 hover:bg-gray-700 cursor-pointer" onclick="loadTraceDetail('${t.session_id}')">
+                        <div class="text-sm truncate text-white">${escapeHtml(t.query.substring(0, 50))}${t.query.length > 50 ? '...' : ''}</div>
+                        <div class="flex items-center gap-2 mt-1 text-xs text-gray-400">
+                            <span>${t.agents_used.length} agents</span>
+                            <span>·</span>
+                            <span>${t.layer_count} layers</span>
+                            <span>·</span>
+                            <span>${t.total_tokens} tokens</span>
+                        </div>
+                        <div class="text-xs text-gray-500 mt-1">${new Date(t.timestamp).toLocaleTimeString()}</div>
+                    </div>
+                `).join('');
+            } catch (e) {
+                console.error('Failed to load team traces:', e);
+            }
+        }
+
+        async function loadTraceDetail(sessionId) {
+            try {
+                const res = await fetch(`/api/team-trace/${sessionId}`);
+                const data = await res.json();
+                if (data.error) {
+                    console.error(data.error);
+                    return;
+                }
+                currentTraceData = data;
+                renderDAG(data);
+                renderDAGSummary(data.summary);
+            } catch (e) {
+                console.error('Failed to load trace detail:', e);
+            }
+        }
+
+        function renderDAG(data) {
+            const container = document.getElementById('dag-visualization');
+
+            if (!data.nodes || data.nodes.length === 0) {
+                container.innerHTML = '<div class="text-gray-500 text-sm">No nodes in DAG</div>';
+                return;
+            }
+
+            // Calculate dimensions based on layers and nodes
+            const layerCount = data.execution_layers.length;
+            const maxNodesInLayer = Math.max(...data.execution_layers.map(l => l.length));
+
+            const nodeWidth = 120;
+            const nodeHeight = 50;
+            const layerGap = 100;
+            const nodeGap = 20;
+
+            const svgWidth = Math.max(350, layerCount * (nodeWidth + layerGap));
+            const svgHeight = Math.max(200, maxNodesInLayer * (nodeHeight + nodeGap) + 50);
+
+            // Build node positions
+            const nodePositions = {};
+            data.nodes.forEach(node => {
+                const layerX = node.layer * (nodeWidth + layerGap) + 50;
+                const nodesInLayer = data.execution_layers[node.layer]?.length || 1;
+                const layerHeight = nodesInLayer * (nodeHeight + nodeGap);
+                const startY = (svgHeight - layerHeight) / 2;
+                const nodeY = startY + node.position * (nodeHeight + nodeGap) + nodeHeight / 2;
+
+                nodePositions[node.id] = { x: layerX + nodeWidth / 2, y: nodeY };
+            });
+
+            // Generate SVG
+            let svg = `<svg width="${svgWidth}" height="${svgHeight}" class="w-full" viewBox="0 0 ${svgWidth} ${svgHeight}">`;
+
+            // Arrow marker definition
+            svg += `
+                <defs>
+                    <marker id="arrowhead" markerWidth="10" markerHeight="7"
+                            refX="10" refY="3.5" orient="auto">
+                        <polygon points="0 0, 10 3.5, 0 7" fill="#4b5563"/>
+                    </marker>
+                </defs>
+            `;
+
+            // Draw edges first (behind nodes)
+            (data.edges || []).forEach(edge => {
+                const fromPos = nodePositions[edge.from];
+                const toPos = nodePositions[edge.to];
+                if (fromPos && toPos) {
+                    svg += `
+                        <line x1="${fromPos.x + nodeWidth/2}" y1="${fromPos.y}"
+                              x2="${toPos.x - nodeWidth/2}" y2="${toPos.y}"
+                              stroke="#4b5563" stroke-width="2" marker-end="url(#arrowhead)"/>
+                    `;
+                }
+            });
+
+            // Draw nodes
+            data.nodes.forEach(node => {
+                const pos = nodePositions[node.id];
+                if (!pos) return;
+
+                const statusColor = node.status === 'done' ? '#10b981' : '#6b7280';
+                const rx = pos.x - nodeWidth / 2;
+                const ry = pos.y - nodeHeight / 2;
+                const shortId = node.id.length > 14 ? node.id.substring(0, 12) + '..' : node.id;
+
+                svg += `
+                    <g class="cursor-pointer" onclick="showNodeDetail('${node.id}')">
+                        <rect x="${rx}" y="${ry}" width="${nodeWidth}" height="${nodeHeight}"
+                              rx="6" fill="#1f2937" stroke="${statusColor}" stroke-width="2"/>
+                        <text x="${pos.x}" y="${pos.y - 5}" text-anchor="middle" fill="white" font-size="11"
+                              font-weight="bold">${shortId}</text>
+                        <text x="${pos.x}" y="${pos.y + 10}" text-anchor="middle" fill="#9ca3af" font-size="9">
+                            ${node.tokens}t · ${node.time_ms}ms
+                        </text>
+                    </g>
+                `;
+            });
+
+            // Layer labels
+            data.execution_layers.forEach((layer, idx) => {
+                const x = idx * (nodeWidth + layerGap) + 50 + nodeWidth / 2;
+                svg += `<text x="${x}" y="20" text-anchor="middle" fill="#6b7280" font-size="10">Layer ${idx + 1}</text>`;
+            });
+
+            svg += '</svg>';
+            container.innerHTML = svg;
+        }
+
+        function showNodeDetail(nodeId) {
+            if (!currentTraceData) return;
+
+            const node = currentTraceData.nodes.find(n => n.id === nodeId);
+            if (!node) return;
+
+            document.getElementById('dag-node-title').textContent = nodeId;
+            document.getElementById('dag-node-question').textContent = node.sub_question || 'N/A';
+            document.getElementById('dag-node-tokens').textContent = node.tokens;
+            document.getElementById('dag-node-time').textContent = node.time_ms + 'ms';
+            document.getElementById('dag-node-response').textContent = node.response || 'No response';
+
+            document.getElementById('dag-node-detail').classList.remove('hidden');
+        }
+
+        function renderDAGSummary(summary) {
+            if (!summary) return;
+
+            document.getElementById('dag-total-tokens').textContent = summary.total_tokens;
+            document.getElementById('dag-decomp-tokens').textContent = summary.decomposition_tokens;
+            document.getElementById('dag-synth-tokens').textContent = summary.synthesis_tokens;
+            document.getElementById('dag-total-time').textContent = summary.total_time_ms + 'ms';
+            document.getElementById('dag-speedup').textContent = summary.parallel_speedup.toFixed(2) + 'x';
+
+            document.getElementById('dag-summary').classList.remove('hidden');
         }
 
         function addEvent(event) {
@@ -1700,6 +3111,14 @@ DASHBOARD_HTML = """
                 'qc_report_complete': 'event-qc-report',
             };
 
+            // Check if this is a benchmark event (via _event_type detail)
+            const benchmarkType = event.data?._event_type || '';
+            if (benchmarkType.startsWith('benchmark_')) {
+                // Override class for benchmark events
+                if (benchmarkType.includes('started')) eventClasses[event.event_type] = 'bg-indigo-100 border-l-3 border-indigo-500';
+                if (benchmarkType.includes('completed')) eventClasses[event.event_type] = 'bg-indigo-50 border-l-3 border-indigo-400';
+            }
+
             const eventIcons = {
                 'query_received': '📝',
                 'routing_decision': '🔀',
@@ -1725,6 +3144,14 @@ DASHBOARD_HTML = """
                 'qc_synthesis_started': '📊',
                 'qc_report_complete': '📋',
             };
+
+            // Override icon for benchmark events
+            if (benchmarkType === 'benchmark_started') eventIcons[event.event_type] = '🏁';
+            if (benchmarkType === 'benchmark_completed') eventIcons[event.event_type] = '🏆';
+            if (benchmarkType === 'benchmark_repo_started') eventIcons[event.event_type] = '📂';
+            if (benchmarkType === 'benchmark_repo_completed') eventIcons[event.event_type] = '📊';
+            if (benchmarkType === 'benchmark_task_started') eventIcons[event.event_type] = '▶️';
+            if (benchmarkType === 'benchmark_task_completed') eventIcons[event.event_type] = '✅';
 
             const div = document.createElement('div');
             div.className = `event-card p-2 rounded text-sm ${eventClasses[event.event_type] || 'bg-gray-700'}`;
@@ -1756,6 +3183,30 @@ DASHBOARD_HTML = """
 
         function formatEventData(event) {
             const d = event.data;
+            const repoTag = d.repo ? `<span class="inline-block bg-indigo-200 text-indigo-800 text-xs px-1.5 py-0.5 rounded font-medium mr-1">${escapeHtml(d.repo)}</span>` : '';
+
+            // Handle benchmark lifecycle events first
+            const benchmarkType = d._event_type || '';
+            if (benchmarkType.startsWith('benchmark_')) {
+                switch (benchmarkType) {
+                    case 'benchmark_started':
+                        return `<strong>Benchmark Started</strong><br>Repos: ${(d.repos || []).join(', ')}<br>Conditions: ${(d.conditions || []).join(', ')}<br>Run ID: ${d.run_id || '?'}`;
+                    case 'benchmark_completed':
+                        return `<strong>Benchmark Complete</strong><br>Passed: ${d.passed || 0}/${d.total || 0}<br>Run ID: ${d.run_id || '?'}`;
+                    case 'benchmark_repo_started':
+                        return `${repoTag}<strong>Repo Testing Started</strong> — Condition ${d.condition || '?'}`;
+                    case 'benchmark_repo_completed':
+                        return `${repoTag}<strong>Repo Testing Done</strong> — ${d.passed || 0}/${d.total || 0} passed (Condition ${d.condition || '?'})`;
+                    case 'benchmark_task_started':
+                        return `${repoTag}<strong>${escapeHtml(d.task_id || '?')}</strong> (${d.task_type || '?'}, Condition ${d.condition || '?'})`;
+                    case 'benchmark_task_completed':
+                        const status = d.success ? (d.test_passed !== undefined ? (d.test_passed ? '✅ PASS' : '❌ FAIL') : '✅ OK') : '❌ ERROR';
+                        return `${repoTag}<strong>${escapeHtml(d.task_id || '?')}</strong> ${status} (${d.time_seconds || 0}s)`;
+                    default:
+                        return `${repoTag}${d.description || JSON.stringify(d).slice(0, 100)}`;
+                }
+            }
+
             switch (event.event_type) {
                 case 'query_received':
                     return `"${d.query}"${d.forced_agent ? ` → forced to ${d.forced_agent}` : ''}`;
@@ -1772,18 +3223,18 @@ DASHBOARD_HTML = """
                 // Claude Code events
                 case 'claude_code_task':
                     const queryText = d.query || d.description || '';
-                    return `<div class="mb-1"><strong>Query:</strong></div>
+                    return `${repoTag}<div class="mb-1"><strong>Query:</strong></div>
                         <div class="bg-gray-800 p-2 rounded text-white whitespace-pre-wrap max-h-40 overflow-y-auto">${escapeHtml(queryText)}</div>`;
                 case 'claude_code_search':
-                    return `<strong>Search:</strong> ${d.description}${d.pattern ? ` (${d.pattern})` : ''}`;
+                    return `${repoTag}<strong>Search:</strong> ${d.description}${d.pattern ? ` (${d.pattern})` : ''}`;
                 case 'claude_code_read':
-                    return `<strong>Read:</strong> ${d.description}${d.file ? ` - ${d.file}` : ''}`;
+                    return `${repoTag}<strong>Read:</strong> ${d.description}${d.file ? ` - ${d.file}` : ''}`;
                 case 'claude_code_edit':
-                    return `<strong>Edit:</strong> ${d.description}${d.file ? ` - ${d.file}` : ''}`;
+                    return `${repoTag}<strong>Edit:</strong> ${d.description}${d.file ? ` - ${d.file}` : ''}`;
                 case 'claude_code_result':
                     const resp = d.response || d.description || '';
                     const query = d.query || '';
-                    return `<div class="mb-1"><strong>Agent:</strong> ${d.agent_id || 'unknown'} | <strong>Tokens:</strong> ${d.tokens_used || 0}</div>
+                    return `${repoTag}<div class="mb-1"><strong>Agent:</strong> ${d.agent_id || 'unknown'} | <strong>Tokens:</strong> ${d.tokens_used || 0}</div>
                         ${query ? `<details class="mb-2"><summary class="cursor-pointer text-blue-600">View Query</summary>
                         <div class="bg-gray-800 p-2 rounded text-white whitespace-pre-wrap max-h-32 overflow-y-auto mt-1">${escapeHtml(query)}</div></details>` : ''}
                         <details open><summary class="cursor-pointer text-green-600 font-medium">Response</summary>
@@ -1844,9 +3295,10 @@ DASHBOARD_HTML = """
                     responsePanel.innerHTML = `<div class="text-red-400">Error: ${data.error}</div>`;
                 } else {
                     const agent = agents.find(a => a.id === data.agent_id) || {};
+                    const tierBg = agent.tier === 'A' ? 'bg-blue-900' : agent.tier === 'C' ? 'bg-purple-900' : 'bg-green-900';
                     responsePanel.innerHTML = `
                         <div class="mb-2 flex items-center gap-2">
-                            <span class="px-2 py-1 rounded text-xs ${agent.tier === 'A' ? 'bg-blue-900' : 'bg-green-900'}">
+                            <span class="px-2 py-1 rounded text-xs ${tierBg}">
                                 ${data.agent_id}
                             </span>
                             <span class="text-xs text-gray-400">${data.tokens_used} tokens</span>

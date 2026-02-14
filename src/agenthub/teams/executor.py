@@ -1,3 +1,4 @@
+from __future__ import annotations
 """DAG Team Executor for multi-agent query execution.
 
 This module orchestrates the execution of complex queries across
@@ -47,11 +48,11 @@ class DAGTeamExecutor:
         hub: "AgentHub",
         import_graph: "ImportGraph",
         max_parallel: int = 4,
-        decomposer_model: str = "claude-haiku-4-5-20251001",
-        synthesizer_model: str = "claude-sonnet-4-20250514",
-        agent_timeout_seconds: float = 30.0,
-        total_timeout_seconds: float = 120.0,
-        max_total_tokens: int = 50000,
+        decomposer_model: str = "claude-opus-4-20250514",
+        synthesizer_model: str = "claude-opus-4-20250514",
+        agent_timeout_seconds: float = 120.0,
+        total_timeout_seconds: float = 300.0,
+        max_total_tokens: int = 200000,
         skip_synthesis_if_single: bool = True,
     ):
         """Initialize the executor.
@@ -248,11 +249,19 @@ class DAGTeamExecutor:
                     # Build augmented query with dependency results
                     augmented_query = self._augment_with_dependencies(node, dag)
 
+                    # Compute per-agent tool token budget from remaining total.
+                    # 30K per agent gives room for 3-4 tool iterations (each ~8K
+                    # round-trip) instead of the previous 15K which truncated
+                    # after just 2 iterations.
+                    remaining = max(0, self.max_total_tokens - total_tokens)
+                    per_agent = min(30000, remaining // max(len(layer), 1))
+
                     future = pool.submit(
                         self._run_single_agent,
                         agent_id,
                         augmented_query,
                         session,
+                        per_agent,
                     )
                     futures[future] = agent_id
 
@@ -320,6 +329,7 @@ class DAGTeamExecutor:
         agent_id: str,
         query: str,
         session: "Session",
+        max_tool_tokens: int = 15000,
     ) -> tuple[Optional[AgentResponse], int]:
         """Run a single agent and return its response.
 
@@ -327,6 +337,8 @@ class DAGTeamExecutor:
             agent_id: The agent to run.
             query: The query (possibly augmented).
             session: Current session.
+            max_tool_tokens: Per-agent tool token budget (reduced in team
+                mode to prevent token explosion across multiple agents).
 
         Returns:
             Tuple of (AgentResponse or None, execution_time_ms).
@@ -339,7 +351,20 @@ class DAGTeamExecutor:
                 logger.warning(f"Agent {agent_id} not found")
                 return None, 0
 
-            response = agent.run(query, session)
+            # Safety: cap agent context size to prevent 400 errors from
+            # oversized prompts (>200K tokens).  Some Tier B agents can
+            # accumulate 100K+ chars of context, which overflows the API.
+            original_max = agent.spec.max_context_size
+            if agent.spec.max_context_size > 40000:
+                agent.spec.max_context_size = 40000
+
+            try:
+                response = agent.run(
+                    query, session, max_tool_tokens=max_tool_tokens,
+                )
+            finally:
+                agent.spec.max_context_size = original_max
+
             exec_time = int((time.time() - start_time) * 1000)
 
             return response, exec_time

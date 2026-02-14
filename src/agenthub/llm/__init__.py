@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Multi-LLM support for AgentHub.
 
 This module provides an abstraction layer that allows agents to work

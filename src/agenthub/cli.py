@@ -1,16 +1,22 @@
+from __future__ import annotations
 """AgentHub CLI - Docker-like commands for agent management.
 
 Commands:
+    agenthub init        - Initialize AgentHub in a project (one-command setup)
     agenthub build       - Discover Tier A agents, generate Tier B agents
     agenthub up          - Start dashboard and verify agents
     agenthub watch       - Enable file watching for automatic refresh
     agenthub status      - Show current agent status
+    agenthub clean       - Remove Tier B agents and sub-agents
     agenthub restructure - Delete and regenerate Tier B agents
 
 Example:
+    $ agenthub init              # Initialize current directory
+    $ agenthub init /path/to/dir # Initialize specific directory
     $ agenthub build ./my-project
     $ agenthub up --port 3001
     $ agenthub watch ./my-project
+    $ agenthub clean             # Remove Tier B agents
     $ agenthub restructure ./my-project --force
 """
 
@@ -32,6 +38,51 @@ def _load_env():
     """Load environment variables from .env files."""
     from agenthub.config import load_env_files
     load_env_files()
+
+
+def cmd_init(args):
+    """Init command - one-command project setup.
+
+    This is the recommended starting point for new projects:
+    1. Detects project type (Python, Node.js, etc.)
+    2. Creates {project}_agents.py with auto-discovery
+    3. Creates .agenthubignore for ignoring build artifacts
+    4. Configures MCP for Claude Code integration
+    5. Checks for API keys
+
+    Usage:
+        $ agenthub init              # Initialize current directory
+        $ agenthub init /path/to/dir # Initialize specific directory
+    """
+    _setup_path()
+
+    from agenthub.setup import setup_project
+
+    project_path = args.path or os.getcwd()
+    project_path = os.path.abspath(project_path)
+
+    if not os.path.isdir(project_path):
+        print(f"Error: '{project_path}' is not a valid directory")
+        return 1
+
+    results = setup_project(
+        project_path=project_path,
+        auto_mcp=not args.manual_mcp,
+        skip_api_key_check=args.skip_api_check,
+        verbose=not args.quiet,
+    )
+
+    if results["errors"]:
+        for err in results["errors"]:
+            print(f"Error: {err}")
+        return 1
+
+    if results["warnings"] and not args.quiet:
+        print("Warnings:")
+        for warn in results["warnings"]:
+            print(f"  - {warn}")
+
+    return 0 if results["success"] else 1
 
 
 def cmd_build(args):
@@ -163,6 +214,15 @@ def cmd_up(args):
     if not os.path.isdir(project_root):
         print(f"Error: '{project_root}' is not a valid directory")
         return 1
+
+    # Load .env from project directory
+    project_env = Path(project_root) / ".env"
+    if project_env.exists():
+        try:
+            from dotenv import load_dotenv
+            load_dotenv(project_env, override=True)
+        except ImportError:
+            pass
 
     project_name = Path(project_root).name
     port = args.port or 3001
@@ -588,6 +648,111 @@ def cmd_status(args):
         return 1
 
 
+def cmd_clean(args):
+    """Clean command - remove Tier B agents and sub-agents.
+
+    This removes all auto-generated code agents while preserving
+    Tier A (business/domain) agents. Useful when you want to:
+    - Regenerate Tier B agents with new settings
+    - Clear cached agent configurations
+    - Start fresh with only Tier A agents
+
+    Usage:
+        $ agenthub clean              # Clean current project
+        $ agenthub clean /path/to/dir # Clean specific project
+        $ agenthub clean --all        # Also clear sub-agent policy config
+    """
+    _setup_path()
+    _load_env()
+
+    from pathlib import Path
+    import json
+
+    from agenthub.setup import get_current_project
+
+    # Get project path
+    project_root = args.path
+    if not project_root:
+        project_root = get_current_project()
+    if not project_root:
+        project_root = os.getcwd()
+    project_root = os.path.abspath(project_root)
+
+    if not os.path.isdir(project_root):
+        print(f"Error: '{project_root}' is not a valid directory")
+        return 1
+
+    project_name = Path(project_root).name
+
+    print("=" * 60)
+    print(f"  AgentHub Clean: {project_name}")
+    print("=" * 60)
+    print()
+
+    # Show what will be cleaned
+    print("This will remove:")
+    print("  - All Tier B (auto-generated code) agents")
+    print("  - All sub-agents")
+    if args.all:
+        print("  - Sub-agent policy configuration")
+    print()
+    print("Tier A (business/domain) agents will be preserved.")
+    print()
+
+    # Confirm unless --force
+    if not args.force:
+        response = input("Continue? [y/N] ").strip().lower()
+        if response != 'y':
+            print("Cancelled.")
+            return 0
+
+    cleaned_items = []
+
+    # Clean sub-agent policy config if --all
+    if args.all:
+        config_file = Path.home() / ".agenthub" / "sub_agent_policy.json"
+        if config_file.exists():
+            config_file.unlink()
+            cleaned_items.append("Sub-agent policy config")
+            print("  Removed: ~/.agenthub/sub_agent_policy.json")
+
+    # Note: Tier B agents are generated dynamically by discover_all_agents()
+    # They are not persisted to disk, so "cleaning" means they simply won't
+    # be generated on the next run if we clear the relevant caches.
+
+    # Clear any cached agent data
+    cache_dir = Path.home() / ".agenthub" / "cache"
+    if cache_dir.exists():
+        import shutil
+        # Only remove project-specific cache
+        project_cache = cache_dir / project_name
+        if project_cache.exists():
+            shutil.rmtree(project_cache)
+            cleaned_items.append(f"Project cache: {project_name}")
+            print(f"  Removed: ~/.agenthub/cache/{project_name}/")
+
+    # Clear import graph cache if exists
+    import_graph_cache = Path.home() / ".agenthub" / "import_graphs" / f"{project_name}.json"
+    if import_graph_cache.exists():
+        import_graph_cache.unlink()
+        cleaned_items.append("Import graph cache")
+        print(f"  Removed: ~/.agenthub/import_graphs/{project_name}.json")
+
+    print()
+    if cleaned_items:
+        print(f"Cleaned {len(cleaned_items)} item(s).")
+    else:
+        print("Nothing to clean (Tier B agents are generated dynamically).")
+
+    print()
+    print("Next steps:")
+    print("  - Run 'agenthub up' to regenerate Tier B agents")
+    print("  - Adjust settings in dashboard if needed")
+    print()
+
+    return 0
+
+
 def main():
     """Main CLI entry point."""
     parser = argparse.ArgumentParser(
@@ -596,17 +761,22 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Commands:
+  init         Initialize AgentHub in a project (recommended for new users)
   build        Discover Tier A agents, generate Tier B agents
   up           Start dashboard and verify agents are working
   watch        Enable file watching for automatic context refresh
   status       Show current agent status
+  clean        Remove Tier B agents and sub-agents
   restructure  Delete and regenerate all Tier B agents
 
 Examples:
+  agenthub init              # One-command setup
+  agenthub init /path/to/dir # Initialize specific directory
   agenthub build ./my-project
   agenthub up --port 3001
   agenthub watch ./my-project
   agenthub status
+  agenthub clean             # Remove Tier B agents
   agenthub restructure ./my-project --force
         """
     )
@@ -618,6 +788,33 @@ Examples:
     )
 
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
+
+    # Init command (recommended for new users)
+    init_parser = subparsers.add_parser(
+        "init",
+        help="Initialize AgentHub in a project (one-command setup)"
+    )
+    init_parser.add_argument(
+        "path",
+        nargs="?",
+        help="Project root path (default: current directory)"
+    )
+    init_parser.add_argument(
+        "--manual-mcp",
+        action="store_true",
+        help="Don't auto-configure MCP, show config for manual setup"
+    )
+    init_parser.add_argument(
+        "--skip-api-check",
+        action="store_true",
+        help="Skip API key verification"
+    )
+    init_parser.add_argument(
+        "-q", "--quiet",
+        action="store_true",
+        help="Minimal output"
+    )
+    init_parser.set_defaults(func=cmd_init)
 
     # Build command
     build_parser = subparsers.add_parser(
@@ -713,6 +910,28 @@ Examples:
         help="Project root path (default: current directory)"
     )
     status_parser.set_defaults(func=cmd_status)
+
+    # Clean command
+    clean_parser = subparsers.add_parser(
+        "clean",
+        help="Remove Tier B agents and sub-agents"
+    )
+    clean_parser.add_argument(
+        "path",
+        nargs="?",
+        help="Project root path (default: current directory)"
+    )
+    clean_parser.add_argument(
+        "-f", "--force",
+        action="store_true",
+        help="Skip confirmation prompt"
+    )
+    clean_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Also clear sub-agent policy configuration"
+    )
+    clean_parser.set_defaults(func=cmd_clean)
 
     # Restructure command
     restructure_parser = subparsers.add_parser(

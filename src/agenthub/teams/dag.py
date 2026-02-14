@@ -1,3 +1,4 @@
+from __future__ import annotations
 """DAG data structures for team execution.
 
 This module provides the core data structures for representing and executing

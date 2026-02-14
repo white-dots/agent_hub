@@ -1,10 +1,11 @@
+from __future__ import annotations
 """Factory for creating auto-generated agents."""
 
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from agenthub.agents.base import BaseAgent
+from agenthub.agents.base import BaseAgent, heuristic_scope_check
 from agenthub.auto.analyzer import AgentBoundary
 from agenthub.auto.config import AutoAgentConfig
 from agenthub.context import ContextBuilder
@@ -20,6 +21,14 @@ class AutoCodeAgent(BaseAgent):
     This agent is created automatically by the AutoAgentFactory
     and knows about a specific portion of the codebase.
     """
+
+    # Keywords that indicate a query is about a specific technology/domain
+    DOMAIN_INDICATORS = {
+        "frontend": ["react", "component", "tsx", "jsx", "css", "style", "ui", "button", "form", "modal", "hook", "useState", "useEffect"],
+        "backend": ["api", "endpoint", "route", "controller", "service", "handler", "request", "response", "middleware"],
+        "database": ["model", "schema", "migration", "query", "sql", "database", "db", "orm", "entity"],
+        "test": ["test", "spec", "mock", "fixture", "jest", "pytest", "unittest"],
+    }
 
     def __init__(
         self,
@@ -60,6 +69,79 @@ class AutoCodeAgent(BaseAgent):
         )
 
         return "\n".join(parts)
+
+    def _quick_scope_check(self, query: str) -> dict:
+        """Quick check if query is in this agent's scope without LLM call.
+
+        Uses keyword matching to detect if a query is clearly about a different
+        domain than what this agent handles.
+
+        Args:
+            query: User's query to check.
+
+        Returns:
+            Dict with 'in_scope' bool, 'message' for rejection, and optional 'suggested_agent'.
+        """
+        # Run shared heuristic check first (keyword overlap + exclusions)
+        shared_check = heuristic_scope_check(self.spec, query)
+        if not shared_check["in_scope"]:
+            return shared_check
+
+        query_lower = query.lower()
+
+        # Get this agent's domain from folder name
+        folder_name = Path(self.root_path).name.lower()
+
+        # Determine agent's likely domain
+        agent_domain = None
+        for domain, indicators in self.DOMAIN_INDICATORS.items():
+            if folder_name in indicators or any(ind in folder_name for ind in indicators):
+                agent_domain = domain
+                break
+
+        # Check if query mentions a different domain clearly
+        query_domains = set()
+        for domain, indicators in self.DOMAIN_INDICATORS.items():
+            matching_indicators = [ind for ind in indicators if ind in query_lower]
+            if len(matching_indicators) >= 2:  # Strong signal
+                query_domains.add(domain)
+
+        # If query clearly references a domain we don't handle
+        if query_domains and agent_domain and agent_domain not in query_domains:
+            # Find which domain the query is about
+            target_domain = list(query_domains)[0]
+            suggested = f"{target_domain.title()} Expert"
+
+            return {
+                "in_scope": False,
+                "message": f"This question is about {target_domain} code, which is outside my scope. "
+                           f"I handle the {folder_name}/ module. "
+                           f"Please ask the **{suggested}** instead.",
+                "suggested_agent": suggested,
+            }
+
+        # Check if query mentions specific file extensions we don't handle
+        file_ext_domains = {
+            ".tsx": "frontend", ".jsx": "frontend", ".css": "frontend", ".scss": "frontend",
+            ".py": None,  # Python could be any domain
+            ".sql": "database",
+        }
+
+        for ext, domain in file_ext_domains.items():
+            if ext in query_lower and domain and agent_domain != domain:
+                # Check if we have files with this extension
+                has_ext = any(ext in p for p in self.include_patterns)
+                if not has_ext:
+                    suggested = f"{domain.title()} Expert"
+                    return {
+                        "in_scope": False,
+                        "message": f"This question involves {ext} files, which I don't handle. "
+                                   f"Please ask the **{suggested}** instead.",
+                        "suggested_agent": suggested,
+                    }
+
+        # Default: assume in scope
+        return {"in_scope": True, "message": ""}
 
 
 class AutoAgentFactory:

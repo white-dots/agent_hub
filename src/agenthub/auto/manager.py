@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Manager for auto-generated agent lifecycle."""
 
 from datetime import datetime
@@ -10,6 +11,9 @@ from agenthub.auto.factory import AutoAgentFactory
 
 if TYPE_CHECKING:
     from agenthub.agents.base import BaseAgent
+    from agenthub.auto.import_graph import ImportGraph
+    from agenthub.auto.sub_agent_manager import SubAgentManager
+    from agenthub.auto.sub_agent_policy import SubAgentPolicy
     from agenthub.hub import AgentHub
 
 
@@ -51,6 +55,9 @@ class AutoAgentManager:
         # Track auto-generated agents
         self._auto_agents: dict[str, "BaseAgent"] = {}
         self._last_scan: Optional[datetime] = None
+
+        # Sub-agent support
+        self._sub_agent_manager: Optional["SubAgentManager"] = None
 
     def scan_and_register(self) -> list[str]:
         """Scan codebase and register auto-generated agents.
@@ -169,6 +176,11 @@ class AutoAgentManager:
         Returns:
             Number of agents unregistered.
         """
+        # Unregister sub-agents first
+        sub_count = 0
+        if self._sub_agent_manager:
+            sub_count = self._sub_agent_manager.unregister_all_sub_agents()
+
         count = 0
         for agent_id in list(self._auto_agents.keys()):
             try:
@@ -177,7 +189,101 @@ class AutoAgentManager:
                 count += 1
             except Exception:
                 pass
-        return count
+        return count + sub_count
+
+    # === Sub-Agent Support ===
+
+    def enable_sub_agents(
+        self,
+        import_graph: "ImportGraph",
+        policy: Optional["SubAgentPolicy"] = None,
+    ) -> "SubAgentManager":
+        """Enable sub-agent subdivision for large Tier B agents.
+
+        This analyzes all Tier B agents and subdivides those that are
+        too large (based on the policy thresholds) into focused sub-agents.
+
+        Args:
+            import_graph: ImportGraph for clustering analysis.
+            policy: SubAgentPolicy for subdivision rules. Uses defaults if None.
+
+        Returns:
+            SubAgentManager instance for managing sub-agents.
+
+        Example:
+            >>> from agenthub.auto.import_graph import ImportGraph
+            >>> graph = ImportGraph(project_root)
+            >>> graph.build()
+            >>> sub_manager = auto_manager.enable_sub_agents(graph)
+            >>> print(sub_manager.get_hierarchy_report())
+        """
+        from agenthub.auto.sub_agent_manager import SubAgentManager
+        from agenthub.auto.sub_agent_policy import SubAgentPolicy
+
+        self._sub_agent_manager = SubAgentManager(
+            auto_manager=self,
+            import_graph=import_graph,
+            policy=policy or SubAgentPolicy(),
+        )
+        self._sub_agent_manager.evaluate_and_subdivide()
+        return self._sub_agent_manager
+
+    def get_most_specific_agent(self, file_path: str) -> Optional["BaseAgent"]:
+        """Get the most specific agent owning a file.
+
+        Checks sub-agents first (most specific), then Tier B agents.
+
+        Args:
+            file_path: Path to the file.
+
+        Returns:
+            Most specific agent owning this file, or None.
+        """
+        # Check sub-agents first
+        if self._sub_agent_manager:
+            sub_agent = self._sub_agent_manager.get_most_specific_agent(file_path)
+            if sub_agent:
+                return sub_agent
+
+        # Fall back to Tier B agents
+        return self._get_agent_for_file(file_path)
+
+    def _get_agent_for_file(self, file_path: str) -> Optional["BaseAgent"]:
+        """Get the Tier B agent that owns a file."""
+        for agent_id, agent in self._auto_agents.items():
+            if self._file_in_agent_scope(file_path, agent):
+                return agent
+        return None
+
+    def _file_in_agent_scope(self, file_path: str, agent: "BaseAgent") -> bool:
+        """Check if a file falls within an agent's context_paths."""
+        import fnmatch
+
+        file_path = file_path.replace("\\", "/")
+
+        for context_path in agent.spec.context_paths:
+            context_path = context_path.replace("\\", "/")
+
+            # Glob pattern match
+            if fnmatch.fnmatch(file_path, context_path):
+                return True
+
+            # Directory prefix match
+            if context_path.endswith("/*") or context_path.endswith("/**"):
+                dir_prefix = context_path.rstrip("/*")
+                if file_path.startswith(dir_prefix):
+                    return True
+
+            # Simple prefix match
+            if file_path.startswith(context_path.rstrip("/")):
+                return True
+
+        return False
+
+    @property
+    def sub_agent_manager(self) -> Optional["SubAgentManager"]:
+        """Get the sub-agent manager if enabled."""
+        return self._sub_agent_manager
 
 
 def print_coverage_map(hub: "AgentHub", project_root: str) -> None:

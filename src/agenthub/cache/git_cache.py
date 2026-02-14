@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Git-aware context caching.
 
 This module provides caching that automatically invalidates when:

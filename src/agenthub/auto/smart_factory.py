@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Smart agent factory that creates agents based on semantic code analysis.
 
 This factory uses CodebaseDiscovery to understand the codebase and create
@@ -13,14 +14,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from agenthub.agents.base import BaseAgent
+from agenthub.agents.base import BaseAgent, heuristic_scope_check
 from agenthub.auto.config import AutoAgentConfig
 from agenthub.auto.discovery import CodebaseDiscovery, ModuleInfo, ProjectProfile
 from agenthub.auto.domain_analysis import Domain, DomainAnalysis
 from agenthub.auto.dynamic_rnr import DynamicRnRGenerator
 from agenthub.auto.import_graph import ImportGraph
 from agenthub.context import ContextBuilder
-from agenthub.models import AgentSpec
+from agenthub.models import AgentSpec, RoutingConfig
 
 if TYPE_CHECKING:
     import anthropic
@@ -81,6 +82,20 @@ class SmartCodeAgent(BaseAgent):
             result = result[: self.spec.max_context_size] + "\n... [truncated]"
 
         return result
+
+    def _quick_scope_check(self, query: str) -> dict:
+        """Quick check if query is in this agent's scope without LLM call.
+
+        Uses the shared heuristic check (keyword overlap + exclusion list)
+        to catch obviously out-of-scope queries before any LLM call.
+
+        Args:
+            query: User's query to check.
+
+        Returns:
+            Dict with 'in_scope' bool, 'message' str, and optional 'suggested_agent'.
+        """
+        return heuristic_scope_check(self.spec, query)
 
 
 class SmartAgentFactory:
@@ -585,10 +600,14 @@ Reference specific code in your answers.""",
             self.config.max_agent_context_kb * 2,  # Allow 2x for large domains
         )
 
+        # Build per-agent routing config from R&R analysis
+        routing = self._build_routing_config_from_rnr(domain, rnr)
+
         spec = AgentSpec(
             agent_id=domain.agent_id,
             name=domain.name + " Expert",
             description=domain.description,
+            routing=routing,
             context_keywords=domain.keywords,
             context_paths=domain.modules,
             max_context_size=int(context_size_kb * 1024),
@@ -596,6 +615,7 @@ Reference specific code in your answers.""",
             metadata={
                 "auto_generated": True,
                 "tier": "B",
+                "root_path": str(self.project_root),
                 "domain_name": domain.name,
                 "module_count": len(domain.modules),
                 "central_module": domain.central_module,
@@ -620,6 +640,70 @@ Reference specific code in your answers.""",
             client=self.client,
             root_path=str(self.project_root),
             module_paths=domain.modules,
+        )
+
+    def _build_routing_config_from_rnr(
+        self,
+        domain: Domain,
+        rnr: "DynamicRnR",
+    ) -> RoutingConfig:
+        """Build per-agent routing config from R&R analysis.
+
+        Maps semantic analysis into structured routing preferences:
+        - in_scope → domains (what this agent handles)
+        - out_of_scope → exclusions (what to reject)
+        - redirect_hints → fallback_agent_id
+        - top domain keywords → keyword_weights (highest-signal terms)
+
+        Args:
+            domain: The discovered domain.
+            rnr: Roles & Responsibilities data from DynamicRnRGenerator.
+
+        Returns:
+            Populated RoutingConfig.
+        """
+        from agenthub.auto.dynamic_rnr import DynamicRnR
+
+        if not isinstance(rnr, DynamicRnR):
+            return RoutingConfig()
+
+        # Domains: role + top in_scope items
+        domains = []
+        if rnr.role:
+            domains.append(rnr.role.lower().split()[0])  # First word of role
+        for scope in rnr.in_scope[:3]:
+            term = scope.lower().strip()
+            if term and term not in domains:
+                domains.append(term)
+
+        # Exclusions: out_of_scope items
+        exclusions = [s.lower().strip() for s in rnr.out_of_scope[:5] if s.strip()]
+
+        # Keyword weights: top-5 domain keywords get 2.0, rest get 1.0
+        keyword_weights = {}
+        for i, kw in enumerate(domain.keywords):
+            keyword_weights[kw.lower()] = 2.0 if i < 5 else 1.0
+
+        # Fallback: try to resolve redirect hints to an agent ID
+        fallback_agent_id = None
+        if rnr.redirect_hints:
+            # redirect_hints are typically like "Ask the Backend Expert" or
+            # "Route to api_agent". Extract likely agent_id or name.
+            for hint in rnr.redirect_hints:
+                hint_lower = hint.lower().replace(" ", "_")
+                # Simple heuristic: if it looks like an agent_id, use it
+                if "_" in hint_lower and len(hint_lower) < 40:
+                    fallback_agent_id = hint_lower
+                    break
+
+        return RoutingConfig(
+            keyword_weights=keyword_weights,
+            domains=domains,
+            exclusions=exclusions,
+            priority=0,
+            min_confidence=0.3,  # Auto-generated agents use moderate threshold
+            fallback_agent_id=fallback_agent_id,
+            prefer_exact_match=False,
         )
 
     def _create_agents_legacy(self) -> list[BaseAgent]:
@@ -741,6 +825,7 @@ Reference specific code in your answers.""",
             metadata={
                 "auto_generated": True,
                 "tier": "B",
+                "root_path": str(self.project_root),
                 "module_type": module_type,
                 "module_count": len(modules),
                 "generated_at": datetime.now().isoformat(),

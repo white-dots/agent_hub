@@ -1,3 +1,4 @@
+from __future__ import annotations
 #!/usr/bin/env python3
 """Setup script to configure AgentHub MCP server for Claude Code.
 

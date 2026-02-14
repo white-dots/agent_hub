@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Configuration for AgentHub via environment variables."""
 
 import sys
@@ -49,7 +50,7 @@ class AgentHubConfig(BaseSettings):
     """Configuration via environment variables.
 
     All settings can be overridden via environment variables with the
-    AGENTHUB_ prefix. For example: AGENTHUB_DEFAULT_MODEL=claude-opus-4-0-20250115
+    AGENTHUB_ prefix. For example: AGENTHUB_DEFAULT_MODEL=claude-opus-4-20250514
     """
 
     # API Keys
@@ -57,8 +58,8 @@ class AgentHubConfig(BaseSettings):
     openai_api_key: Optional[str] = None  # For embeddings if needed
 
     # Model defaults
-    default_model: str = "claude-sonnet-4-20250514"
-    opus_model: str = "claude-opus-4-0-20250115"
+    default_model: str = "claude-opus-4-20250514"
+    opus_model: str = "claude-opus-4-20250514"
     haiku_model: str = "claude-haiku-3-5-20241022"
 
     # Limits

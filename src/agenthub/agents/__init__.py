@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Agent implementations for AgentHub."""
 
 from agenthub.agents.base import BaseAgent

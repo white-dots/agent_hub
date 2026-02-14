@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Observer for tracking agent conversations."""
 
 from dataclasses import dataclass, field
@@ -32,6 +33,9 @@ class EventType(str, Enum):
     CONCERN_RAISED = "concern_raised"
     QC_SYNTHESIS_STARTED = "qc_synthesis_started"
     QC_REPORT_COMPLETE = "qc_report_complete"
+    # Agent staleness events
+    AGENT_STALE = "agent_stale"
+    AGENT_FRESH = "agent_fresh"
 
 
 @dataclass

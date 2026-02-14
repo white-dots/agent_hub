@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Import graph analysis for dynamic domain detection.
 
 This module builds and analyzes import dependency graphs to identify

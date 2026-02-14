@@ -25,7 +25,7 @@ class MockAgent(BaseAgent):
     def build_context(self) -> str:
         return "Mock context for testing"
 
-    def run(self, query: str, session: Session, model: str | None = None) -> AgentResponse:
+    def run(self, query: str, session: Session, model: str | None = None, injected_context: str = "", max_tool_tokens: int = 30000) -> AgentResponse:
         return AgentResponse(
             content=f"Mock response for: {query}",
             agent_id=self.spec.agent_id,

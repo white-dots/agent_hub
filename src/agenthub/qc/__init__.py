@@ -1,3 +1,4 @@
+from __future__ import annotations
 """QC (Quality Control) module for code change analysis.
 
 This module provides:

@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Dynamic R&R (Roles & Responsibilities) generation.
 
 This module generates R&R for Tier B agents dynamically based on

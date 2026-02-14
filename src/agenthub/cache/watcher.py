@@ -1,8 +1,10 @@
+from __future__ import annotations
 """File system watcher for automatic context refresh and QC analysis.
 
 This module monitors file changes and triggers:
 1. Agent context refresh when relevant files are modified
 2. QC analysis pipeline when changes are detected (if enabled)
+3. Per-agent stale status tracking for dashboard awareness indicators
 
 Requires: pip install watchdog
 
@@ -24,11 +26,13 @@ import os
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Optional
 
 if TYPE_CHECKING:
     from agenthub.hub import AgentHub
+    from agenthub.models import AgentContextStatus
 
 # Try to import watchdog
 _watchdog_available = False
@@ -47,6 +51,34 @@ except ImportError:
 
     class Observer:  # type: ignore
         pass
+
+
+@dataclass
+class AgentStaleInfo:
+    """Tracks staleness info for a single agent."""
+
+    agent_id: str
+    last_query_time: Optional[datetime] = None
+    last_change_time: Optional[datetime] = None
+    changed_files: list[str] = field(default_factory=list)
+
+    @property
+    def is_stale(self) -> bool:
+        """Check if agent has unprocessed changes."""
+        if self.last_change_time is None:
+            return False
+        if self.last_query_time is None:
+            return True  # Never queried but has changes
+        return self.last_change_time > self.last_query_time
+
+    @property
+    def status(self) -> str:
+        """Get human-readable status."""
+        if self.last_query_time is None:
+            return "never_queried"
+        if self.is_stale:
+            return "stale"
+        return "fresh"
 
 
 @dataclass
@@ -79,6 +111,12 @@ class WatchConfig:
 
     # Whether to refresh all agents or just affected ones
     refresh_all: bool = False
+
+    # Whether to refresh agent keywords on file changes (for routing accuracy)
+    refresh_keywords: bool = True
+
+    # Debounce time for keyword refresh (longer since it's more expensive)
+    keyword_refresh_debounce_seconds: float = 10.0
 
 
 class AgentContextHandler(FileSystemEventHandler):
@@ -115,6 +153,10 @@ class AgentContextHandler(FileSystemEventHandler):
         self._pending_paths: set[str] = set()
         self._debounce_timer: Optional[threading.Timer] = None
         self._lock = threading.Lock()
+
+        # Debounce tracking for keyword refresh (separate, longer debounce)
+        self._keyword_refresh_timer: Optional[threading.Timer] = None
+        self._pending_keyword_refresh_paths: set[str] = set()
 
         # Debounce tracking for QC analysis (separate, longer debounce)
         self._analysis_pending_paths: set[str] = set()
@@ -194,6 +236,45 @@ class AgentContextHandler(FileSystemEventHandler):
         # Notify callback
         if self.on_refresh and affected:
             self.on_refresh("file_change", affected)
+
+        # Schedule keyword refresh for affected agents (with longer debounce)
+        if self.config.refresh_keywords and affected:
+            self._schedule_keyword_refresh(affected)
+
+    def _do_keyword_refresh(self) -> None:
+        """Perform keyword refresh for agents after longer debounce."""
+        with self._lock:
+            agents_to_refresh = self._pending_keyword_refresh_paths.copy()
+            self._pending_keyword_refresh_paths.clear()
+            self._keyword_refresh_timer = None
+
+        if not agents_to_refresh:
+            return
+
+        # Refresh keywords for each affected agent
+        try:
+            for agent_id in agents_to_refresh:
+                self.hub.refresh_agent_keywords(agent_id)
+
+            if self.on_refresh:
+                self.on_refresh("keyword_refresh", list(agents_to_refresh))
+        except Exception:
+            pass  # Non-critical if keyword refresh fails
+
+    def _schedule_keyword_refresh(self, agent_ids: list[str]) -> None:
+        """Schedule a debounced keyword refresh for agents."""
+        with self._lock:
+            self._pending_keyword_refresh_paths.update(agent_ids)
+
+            # Cancel existing timer
+            if self._keyword_refresh_timer:
+                self._keyword_refresh_timer.cancel()
+
+            # Schedule new timer with longer debounce
+            self._keyword_refresh_timer = threading.Timer(
+                self.config.keyword_refresh_debounce_seconds, self._do_keyword_refresh
+            )
+            self._keyword_refresh_timer.start()
 
     def _schedule_refresh(self, path: str) -> None:
         """Schedule a debounced refresh."""
@@ -284,6 +365,163 @@ class AgentContextHandler(FileSystemEventHandler):
             self._schedule_analysis(event.src_path)
 
 
+class AgentStaleTracker:
+    """Tracks staleness status for all agents.
+
+    This class monitors when agents are queried and when their domain
+    files change, allowing the dashboard to display awareness indicators.
+
+    Example:
+        >>> tracker = AgentStaleTracker(hub, project_root)
+        >>> tracker.mark_agent_queried("api_agent")
+        >>> tracker.mark_files_changed(["src/api/routes.py"])
+        >>> status = tracker.get_agent_status("api_agent")
+        >>> print(status.is_stale)  # True if files changed after query
+    """
+
+    def __init__(self, hub: "AgentHub", project_root: str):
+        """Initialize the stale tracker.
+
+        Args:
+            hub: AgentHub instance.
+            project_root: Root directory of the project.
+        """
+        self.hub = hub
+        self.project_root = Path(project_root).resolve()
+        self._agent_info: dict[str, AgentStaleInfo] = {}
+        self._lock = threading.Lock()
+
+        # Callback for stale events (agent_id, is_stale)
+        self.on_stale_change: Optional[Callable[[str, bool], None]] = None
+
+    def _get_or_create_info(self, agent_id: str) -> AgentStaleInfo:
+        """Get or create stale info for an agent."""
+        if agent_id not in self._agent_info:
+            self._agent_info[agent_id] = AgentStaleInfo(agent_id=agent_id)
+        return self._agent_info[agent_id]
+
+    def mark_agent_queried(self, agent_id: str) -> None:
+        """Mark that an agent was just queried.
+
+        Args:
+            agent_id: ID of the agent that was queried.
+        """
+        with self._lock:
+            info = self._get_or_create_info(agent_id)
+            was_stale = info.is_stale
+            info.last_query_time = datetime.now()
+            info.changed_files = []  # Clear pending changes
+
+            # Notify if status changed
+            if was_stale and self.on_stale_change:
+                self.on_stale_change(agent_id, False)
+
+    def mark_files_changed(self, file_paths: list[str]) -> list[str]:
+        """Mark that files have changed and update affected agents.
+
+        Args:
+            file_paths: List of relative file paths that changed.
+
+        Returns:
+            List of agent IDs that became stale.
+        """
+        affected_agents = self._find_affected_agents(file_paths)
+        newly_stale = []
+
+        with self._lock:
+            for agent_id in affected_agents:
+                info = self._get_or_create_info(agent_id)
+                was_stale = info.is_stale
+                info.last_change_time = datetime.now()
+
+                # Add changed files that are relevant to this agent
+                agent_spec = self.hub.get_agent(agent_id)
+                if agent_spec:
+                    for path in file_paths:
+                        for context_path in agent_spec.spec.context_paths:
+                            if fnmatch.fnmatch(path, context_path):
+                                if path not in info.changed_files:
+                                    info.changed_files.append(path)
+                                break
+
+                # Track newly stale agents
+                if not was_stale and info.is_stale:
+                    newly_stale.append(agent_id)
+                    if self.on_stale_change:
+                        self.on_stale_change(agent_id, True)
+
+        return newly_stale
+
+    def _find_affected_agents(self, file_paths: list[str]) -> list[str]:
+        """Find which agents are affected by the given file changes."""
+        affected = set()
+
+        for agent_spec in self.hub.list_agents():
+            for context_path in agent_spec.context_paths:
+                for path in file_paths:
+                    if fnmatch.fnmatch(path, context_path):
+                        affected.add(agent_spec.agent_id)
+                        break
+
+        return list(affected)
+
+    def get_agent_status(self, agent_id: str) -> "AgentContextStatus":
+        """Get the current context status for an agent.
+
+        Args:
+            agent_id: ID of the agent.
+
+        Returns:
+            AgentContextStatus with staleness information.
+        """
+        from agenthub.models import AgentContextStatus
+
+        with self._lock:
+            info = self._get_or_create_info(agent_id)
+            return AgentContextStatus(
+                agent_id=agent_id,
+                is_stale=info.is_stale,
+                changed_files=info.changed_files.copy(),
+                last_query_time=info.last_query_time,
+                last_change_time=info.last_change_time,
+                status=info.status,
+            )
+
+    def get_all_statuses(self) -> list["AgentContextStatus"]:
+        """Get context status for all registered agents.
+
+        Returns:
+            List of AgentContextStatus for all agents.
+        """
+        statuses = []
+        for agent_spec in self.hub.list_agents():
+            statuses.append(self.get_agent_status(agent_spec.agent_id))
+        return statuses
+
+    def get_stale_agents(self) -> list[str]:
+        """Get list of agents with pending changes.
+
+        Returns:
+            List of agent IDs that have stale contexts.
+        """
+        stale = []
+        with self._lock:
+            for agent_id, info in self._agent_info.items():
+                if info.is_stale:
+                    stale.append(agent_id)
+        return stale
+
+    def reset_agent(self, agent_id: str) -> None:
+        """Reset tracking info for an agent.
+
+        Args:
+            agent_id: ID of the agent to reset.
+        """
+        with self._lock:
+            if agent_id in self._agent_info:
+                del self._agent_info[agent_id]
+
+
 class FileWatcher:
     """Watches files and refreshes agent contexts on changes.
 
@@ -293,6 +531,8 @@ class FileWatcher:
     Additionally, when QC analysis is enabled, it can trigger the
     analysis pipeline to detect potential issues in changed code.
 
+    Also provides per-agent stale tracking via the stale_tracker property.
+
     Example:
         >>> watcher = FileWatcher(hub, "/path/to/project")
         >>>
@@ -301,6 +541,9 @@ class FileWatcher:
         >>>
         >>> # Optional: Add callback for QC analysis
         >>> watcher.on_changes_for_analysis = lambda files: hub.analyze_changes(files)
+        >>>
+        >>> # Optional: Add callback for stale events
+        >>> watcher.on_stale_change = lambda agent_id, is_stale: print(f"{agent_id}: stale={is_stale}")
         >>>
         >>> watcher.start()
         >>> # ... application runs ...
@@ -340,11 +583,22 @@ class FileWatcher:
         self._handler: Optional[AgentContextHandler] = None
         self._running = False
 
+        # Stale tracker for per-agent awareness
+        self._stale_tracker = AgentStaleTracker(hub, str(self.project_root))
+
         # Callback for refresh events
         self.on_refresh: Optional[Callable[[str, list[str]], None]] = None
 
         # Callback for QC analysis (triggered with list of changed file paths)
         self.on_changes_for_analysis: Optional[Callable[[list[str]], None]] = None
+
+        # Callback for stale events (agent_id, is_stale)
+        self.on_stale_change: Optional[Callable[[str, bool], None]] = None
+
+    @property
+    def stale_tracker(self) -> "AgentStaleTracker":
+        """Get the stale tracker for querying agent staleness."""
+        return self._stale_tracker
 
     def start(self) -> None:
         """Start watching for file changes.
@@ -384,13 +638,28 @@ class FileWatcher:
 
     def _handle_refresh(self, event_type: str, affected_agents: list[str]) -> None:
         """Internal handler for refresh events."""
+        # Forward stale callback if set
+        if self.on_stale_change:
+            self._stale_tracker.on_stale_change = self.on_stale_change
+
         if self.on_refresh:
             self.on_refresh(event_type, affected_agents)
 
     def _handle_changes_for_analysis(self, changed_files: list[str]) -> None:
         """Internal handler for QC analysis trigger."""
+        # Update stale tracker with changed files
+        self._stale_tracker.mark_files_changed(changed_files)
+
         if self.on_changes_for_analysis:
             self.on_changes_for_analysis(changed_files)
+
+    def mark_agent_queried(self, agent_id: str) -> None:
+        """Mark that an agent was queried (used to track freshness).
+
+        Args:
+            agent_id: ID of the agent that was queried.
+        """
+        self._stale_tracker.mark_agent_queried(agent_id)
 
     @property
     def is_running(self) -> bool:

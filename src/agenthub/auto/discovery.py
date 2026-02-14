@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Intelligent codebase discovery for automatic agent generation.
 
 This module provides semantic analysis of codebases to automatically:

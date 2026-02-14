@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Context caching with automatic invalidation.
 
 This module provides intelligent caching for agent contexts with:

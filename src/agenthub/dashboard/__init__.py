@@ -1,3 +1,4 @@
+from __future__ import annotations
 """AgentHub Dashboard - Visualize agent conversations in real-time."""
 
 from agenthub.dashboard.server import create_dashboard_app, run_dashboard

@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Query decomposition for multi-agent execution.
 
 This module breaks down a user query into focused sub-questions,
@@ -71,7 +72,7 @@ class QueryDecomposer:
     def __init__(
         self,
         client: "anthropic.Anthropic",
-        model: str = "claude-haiku-4-5-20251001",
+        model: str = "claude-opus-4-20250514",
     ):
         """Initialize the decomposer.
 

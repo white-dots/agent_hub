@@ -1,3 +1,4 @@
+from __future__ import annotations
 """OpenAI/ChatGPT LLM client implementation."""
 
 from typing import Optional

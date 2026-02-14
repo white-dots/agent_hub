@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Response synthesis for multi-agent execution.
 
 This module combines outputs from multiple agents into a single,
@@ -61,7 +62,7 @@ class ResponseSynthesizer:
     def __init__(
         self,
         client: "anthropic.Anthropic",
-        model: str = "claude-sonnet-4-20250514",
+        model: str = "claude-opus-4-20250514",
     ):
         """Initialize the synthesizer.
 

@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Code agent for codebase navigation and explanation."""
 
 from typing import TYPE_CHECKING

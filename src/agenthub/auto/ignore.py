@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Support for .agenthubignore files.
 
 This module provides gitignore-style pattern matching to exclude files

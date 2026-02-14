@@ -1,3 +1,4 @@
+from __future__ import annotations
 """DAG Teams - Multi-agent collaboration for cross-cutting queries.
 
 This module enables AgentHub to execute complex queries across multiple

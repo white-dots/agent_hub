@@ -1,3 +1,4 @@
+from __future__ import annotations
 """QC Agent - Tier C meta-agent for concern synthesis.
 
 The QC Agent collects concerns from all Tier B agents and synthesizes them
@@ -152,7 +153,7 @@ Always respond with structured JSON containing:
 
         # Call LLM
         response = self.client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-opus-4-20250514",
             max_tokens=4096,
             system=self.spec.system_prompt,
             messages=[{"role": "user", "content": prompt}],

@@ -1,7 +1,8 @@
+from __future__ import annotations
 """Logical tree visualization for agent coverage.
 
 This module provides tree visualization to show how agents
-map to the codebase structure.
+map to the codebase structure, including sub-agent hierarchies.
 
 Example output (ASCII mode - Windows compatible):
     [P] smartstore/ --- 6 agents total
@@ -11,10 +12,12 @@ Example output (ASCII mode - Windows compatible):
     |   +-- * naver_api_agent --- Naver Commerce API integration
     |   +-- * analytics_agent --- Sales analytics, traffic analysis
     |
-    +-- [B] Tier B: Code Agents --- 1 auto-generated
-        +-- (svc) service_agent --- Business logic layer
-            +-- - backend/app/services/best_price.py
-            +-- - backend/app/services/ingestion.py
+    +-- [B] Tier B: Code Agents --- 4 auto-generated
+        +-- [TL] backend_agent --- Backend code (Team Lead)
+        |   +-- (api) backend_api_agent --- API endpoints
+        |   +-- (svc) backend_services_agent --- Services layer
+        |   +-- (mod) backend_models_agent --- Data models
+        +-- (svc) frontend_agent --- Frontend components
 """
 
 from dataclasses import dataclass
@@ -24,6 +27,7 @@ from typing import TYPE_CHECKING, Optional
 if TYPE_CHECKING:
     from agenthub.hub import AgentHub
     from agenthub.models import AgentSpec
+    from agenthub.auto.sub_agent_manager import SubAgentManager
 
 
 @dataclass
@@ -55,7 +59,10 @@ def _get_icons(use_ascii: bool = True) -> dict[str, str]:
             "project": "[P]",
             "tier_a": "[A]",
             "tier_b": "[B]",
+            "tier_c": "[C]",
             "agent": "*",
+            "team_lead": "[TL]",
+            "sub_agent": "->",
             "tag": "#",
             "file": "-",
             "api": "(api)",
@@ -66,13 +73,17 @@ def _get_icons(use_ascii: bool = True) -> dict[str, str]:
             "config": "(cfg)",
             "test": "(test)",
             "default": "(code)",
+            "meta": "(meta)",
         }
     else:
         return {
             "project": "📦",
             "tier_a": "🤖",
             "tier_b": "🔧",
+            "tier_c": "🔮",
             "agent": "◆",
+            "team_lead": "👥",
+            "sub_agent": "└→",
             "tag": "🏷️",
             "file": "📄",
             "api": "🌐",
@@ -83,6 +94,7 @@ def _get_icons(use_ascii: bool = True) -> dict[str, str]:
             "config": "⚙️",
             "test": "🧪",
             "default": "📁",
+            "meta": "🔮",
         }
 
 
@@ -107,10 +119,20 @@ def build_agent_tree(
     Returns:
         TreeNode representing the agent hierarchy.
     """
-    # Get agents by tier
+    # Get agents by tier - check explicit tier metadata first
     all_specs = hub.list_agents()
-    tier_a = [s for s in all_specs if not s.metadata.get("auto_generated")]
-    tier_b = [s for s in all_specs if s.metadata.get("auto_generated")]
+    tier_a = []
+    tier_b = []
+    tier_c = []
+
+    for spec in all_specs:
+        explicit_tier = spec.metadata.get("tier")
+        if explicit_tier == "C":
+            tier_c.append(spec)
+        elif explicit_tier == "B" or spec.metadata.get("auto_generated"):
+            tier_b.append(spec)
+        elif explicit_tier == "A" or not spec.metadata.get("auto_generated"):
+            tier_a.append(spec)
 
     # Icons
     icons = _get_icons(use_ascii)
@@ -152,34 +174,102 @@ def build_agent_tree(
             description=f"{len(tier_b)} auto-generated",
         )
 
-        # Group by module type
-        by_type: dict[str, list["AgentSpec"]] = {}
-        for spec in tier_b:
-            module_type = spec.metadata.get("module_type", "other")
-            by_type.setdefault(module_type, []).append(spec)
+        # Separate team leads from regular agents and sub-agents
+        team_leads: list["AgentSpec"] = []
+        sub_agents: dict[str, list["AgentSpec"]] = {}  # parent_id -> [sub_agents]
+        regular_agents: list["AgentSpec"] = []
 
-        for module_type, specs in sorted(by_type.items()):
-            for spec in specs:
-                agent_node = TreeNode(
-                    name=spec.agent_id,
+        for spec in tier_b:
+            parent_id = spec.metadata.get("parent_agent_id")
+            is_team_lead = spec.metadata.get("is_team_lead", False)
+
+            if parent_id:
+                # This is a sub-agent
+                sub_agents.setdefault(parent_id, []).append(spec)
+            elif is_team_lead:
+                # This is a team lead
+                team_leads.append(spec)
+            else:
+                # Regular agent
+                regular_agents.append(spec)
+
+        # Build nodes for team leads with their sub-agents
+        for lead_spec in team_leads:
+            lead_node = TreeNode(
+                name=lead_spec.agent_id,
+                icon=icons["team_lead"],
+                description=f"{lead_spec.description[:40]}... (Team Lead)" if lead_spec.description else "(Team Lead)",
+            )
+
+            # Add sub-agents under this team lead
+            lead_sub_agents = sub_agents.get(lead_spec.agent_id, [])
+            for sub_spec in lead_sub_agents:
+                module_type = sub_spec.metadata.get("module_type", "other")
+                sub_node = TreeNode(
+                    name=sub_spec.agent_id,
                     icon=_get_type_icon(module_type, use_ascii),
-                    description=spec.description[:50] if spec.description else "",
+                    description=sub_spec.description[:50] if sub_spec.description else "",
                 )
-                # Add file paths
-                for path in spec.context_paths[:5]:
-                    agent_node.children.append(
+                # Add file paths for sub-agent
+                for path in sub_spec.context_paths[:3]:
+                    sub_node.children.append(
                         TreeNode(name=path, icon=icons["file"], is_file=True)
                     )
-                if len(spec.context_paths) > 5:
-                    agent_node.children.append(
+                if len(sub_spec.context_paths) > 3:
+                    sub_node.children.append(
                         TreeNode(
-                            name=f"+{len(spec.context_paths) - 5} more files",
+                            name=f"+{len(sub_spec.context_paths) - 3} more files",
                             icon="...",
                         )
                     )
-                tier_b_node.children.append(agent_node)
+                lead_node.children.append(sub_node)
+
+            tier_b_node.children.append(lead_node)
+
+        # Build nodes for regular agents (not team leads, not sub-agents)
+        for spec in regular_agents:
+            module_type = spec.metadata.get("module_type", "other")
+            agent_node = TreeNode(
+                name=spec.agent_id,
+                icon=_get_type_icon(module_type, use_ascii),
+                description=spec.description[:50] if spec.description else "",
+            )
+            # Add file paths
+            for path in spec.context_paths[:5]:
+                agent_node.children.append(
+                    TreeNode(name=path, icon=icons["file"], is_file=True)
+                )
+            if len(spec.context_paths) > 5:
+                agent_node.children.append(
+                    TreeNode(
+                        name=f"+{len(spec.context_paths) - 5} more files",
+                        icon="...",
+                    )
+                )
+            tier_b_node.children.append(agent_node)
 
         root.children.append(tier_b_node)
+
+    # Tier C branch (meta-agents like QC)
+    if tier_c:
+        tier_c_node = TreeNode(
+            name="Tier C: Meta Agents",
+            icon=icons["tier_c"],
+            description=f"{len(tier_c)} meta-agents",
+        )
+        for spec in tier_c:
+            role = spec.metadata.get("role", "meta_agent")
+            agent_node = TreeNode(
+                name=spec.agent_id,
+                icon=icons.get("meta", icons["agent"]),
+                description=spec.description[:60] if spec.description else "",
+            )
+            # Add role info
+            agent_node.children.append(
+                TreeNode(name=f"Role: {role}", icon=icons["tag"])
+            )
+            tier_c_node.children.append(agent_node)
+        root.children.append(tier_c_node)
 
     return root
 
@@ -264,6 +354,7 @@ def get_routing_explanation(hub: "AgentHub") -> str:
     """
     tier_a = hub.list_agents(tier="A")
     tier_b = hub.list_agents(tier="B")
+    tier_c = hub.list_agents(tier="C")
 
     lines = [
         "Query Routing Logic:",
@@ -273,7 +364,7 @@ def get_routing_explanation(hub: "AgentHub") -> str:
     ]
 
     for spec in tier_a:
-        keywords = ", ".join(spec.context_keywords[:5])
+        keywords = ", ".join(spec.context_keywords[:5]) if spec.context_keywords else ""
         lines.append(f"   * {spec.name}: {keywords}")
 
     lines.append("")
@@ -283,7 +374,14 @@ def get_routing_explanation(hub: "AgentHub") -> str:
         module_type = spec.metadata.get("module_type", "code")
         lines.append(f"   * {spec.name} ({module_type})")
 
+    if tier_c:
+        lines.append("")
+        lines.append("3. Tier C (Meta) agents:")
+        for spec in tier_c:
+            role = spec.metadata.get("role", "meta_agent")
+            lines.append(f"   * {spec.name} ({role})")
+
     lines.append("")
-    lines.append("3. Fallback: First registered agent")
+    lines.append(f"{4 if tier_c else 3}. Fallback: First registered agent")
 
     return "\n".join(lines)

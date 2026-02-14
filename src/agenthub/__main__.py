@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Entry point for running AgentHub as a module.
 
 Usage:

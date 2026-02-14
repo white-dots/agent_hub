@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Configuration for auto-agent generation."""
 
 from pydantic import BaseModel, Field
@@ -22,7 +23,7 @@ class AutoAgentConfig(BaseModel):
         description="Folder must be > this size to warrant an agent",
     )
     max_agent_context_kb: int = Field(
-        default=100,
+        default=60,  # Reduced from 100KB to save tokens (~24K tokens max)
         description="Split if agent context exceeds this size",
     )
 

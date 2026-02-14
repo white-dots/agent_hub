@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Claude/Anthropic LLM client implementation."""
 
 from typing import Optional
@@ -34,7 +35,7 @@ class ClaudeClient(LLMClient):
 
     @property
     def default_model(self) -> str:
-        return "claude-sonnet-4-20250514"
+        return "claude-opus-4-20250514"
 
     @property
     def anthropic_client(self):

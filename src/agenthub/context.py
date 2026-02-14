@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Context building utilities for agents."""
 
 import fnmatch

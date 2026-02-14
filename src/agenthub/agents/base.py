@@ -1,21 +1,128 @@
+from __future__ import annotations
 """Base agent implementation."""
 
 import fnmatch
 import json
+import logging
 import re
 import time
 import uuid
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from agenthub.models import AgentResponse, AgentSpec, Artifact, Message, Session
 
 if TYPE_CHECKING:
     import anthropic
 
+    from agenthub.agents.domain_tools import DomainToolExecutor
     from agenthub.cache import GitAwareCache
     from agenthub.qc.models import AgentAnalysisResult, ChangeSet, Concern
+
+logger = logging.getLogger(__name__)
+
+
+def heuristic_scope_check(spec: "AgentSpec", query: str) -> dict:
+    """Shared heuristic scope check for auto-generated agents.
+
+    Catches obviously out-of-scope queries without any LLM call:
+    1. Zero keyword overlap between query words and agent keywords/description.
+    2. Multiple exclusion term matches from the agent's RoutingConfig.
+
+    The check is intentionally lenient — it only rejects queries that have
+    absolutely zero signal of relevance. False negatives (letting through
+    out-of-scope queries) are cheaper than false positives (rejecting in-scope
+    queries that then have to burn retries).
+
+    Args:
+        spec: The agent's AgentSpec.
+        query: The user's query.
+
+    Returns:
+        Dict with 'in_scope' bool, 'message' str, and optional 'suggested_agent'.
+    """
+    query_lower = query.lower()
+    query_words = set(query_lower.split())
+
+    # Check 1: Zero keyword overlap — strongest free signal.
+    # If the query has enough words to be meaningful but none match
+    # any of the agent's routing keywords, it's very likely out of scope.
+    # Uses both exact-word AND substring matching (to handle plurals like
+    # "tenants" matching keyword "tenant").
+    agent_keywords = set(kw.lower() for kw in spec.context_keywords)
+    has_overlap = bool(query_words & agent_keywords)
+    if not has_overlap:
+        # Fallback: check if any keyword appears as a substring in any query word
+        # (handles plurals, suffixes, compound words)
+        has_overlap = any(
+            kw in qw or qw in kw
+            for kw in agent_keywords
+            for qw in query_words
+            if len(kw) >= 3 and len(qw) >= 3
+        )
+
+    if not has_overlap:
+        # Fallback 2: check overlap with agent description words
+        # (catches conceptual matches like "permission" in description
+        #  even if not an explicit keyword)
+        desc_words = set(spec.description.lower().split())
+        desc_overlap = bool(query_words & desc_words)
+        if not desc_overlap:
+            desc_overlap = any(
+                dw in qw or qw in dw
+                for dw in desc_words
+                for qw in query_words
+                if len(dw) >= 4 and len(qw) >= 4
+            )
+        if desc_overlap:
+            has_overlap = True
+
+    if not has_overlap:
+        # Fallback 3: check if query words overlap with context_paths
+        # (catches file/folder name matches like "insight" in "insight.py")
+        path_words: set[str] = set()
+        for cp in spec.context_paths:
+            # Extract meaningful words from path segments
+            for segment in cp.replace("/", " ").replace(".", " ").replace("_", " ").replace("-", " ").split():
+                if len(segment) >= 3 and segment != "py" and segment != "app":
+                    path_words.add(segment.lower())
+        if path_words:
+            path_overlap = any(
+                pw in qw or qw in pw
+                for pw in path_words
+                for qw in query_words
+                if len(pw) >= 3 and len(qw) >= 3
+            )
+            if path_overlap:
+                has_overlap = True
+
+    # Only reject if we have a long enough query (5+ words) and zero overlap
+    # across keywords, description, and context paths. Short queries are more
+    # ambiguous and should be let through to the LLM.
+    if not has_overlap and len(query_words) >= 5:
+        top_keywords = ", ".join(list(spec.context_keywords)[:5])
+        return {
+            "in_scope": False,
+            "message": (
+                f"This question doesn't appear to be about my domain. "
+                f"I handle: {top_keywords}."
+            ),
+            "suggested_agent": None,
+        }
+
+    # Check 2: Exclusion list — if 2+ exclusion terms match, reject.
+    routing = getattr(spec, "routing", None)
+    if routing and routing.exclusions:
+        excl_matches = sum(1 for excl in routing.exclusions if excl.lower() in query_lower)
+        if excl_matches >= 2:
+            return {
+                "in_scope": False,
+                "message": "This question is outside my scope based on exclusion rules.",
+                "suggested_agent": None,
+            }
+
+    return {"in_scope": True, "message": ""}
 
 
 class BaseAgent(ABC):
@@ -135,33 +242,90 @@ class BaseAgent(ABC):
         session: Session,
         model: Optional[str] = None,
         injected_context: str = "",
+        max_tool_tokens: int = 30000,
     ) -> AgentResponse:
         """Execute the agent on a query.
+
+        Three-stage scope filtering before the expensive full-context LLM call:
+        1. Free heuristic check (_quick_scope_check) — keyword overlap, exclusions
+        2. Cheap LLM pre-screen (_llm_scope_prescreen) — Haiku with ~500 tokens
+        3. Full context load + main LLM call — only if both checks pass
 
         Args:
             query: User's query to process.
             session: Current conversation session.
             model: Optional model override.
             injected_context: Optional context from related agents (cross-agent sharing).
+            max_tool_tokens: Token budget for domain tool usage (default 30K,
+                reduced in team mode to prevent token explosion).
 
         Returns:
             AgentResponse with content and metadata.
         """
-        # Build messages
-        messages = self._build_messages(query, session)
+        # Stage 1: Free heuristic check — avoid any LLM call
+        scope_check = self._quick_scope_check(query)
+        if not scope_check["in_scope"]:
+            return AgentResponse(
+                content=scope_check["message"],
+                agent_id=self.spec.agent_id,
+                session_id=session.session_id,
+                tokens_used=0,
+                artifacts=[],
+                metadata={
+                    "scope_rejected": True,
+                    "rejection_method": "heuristic",
+                    "suggested_agent": scope_check.get("suggested_agent"),
+                },
+            )
 
-        # Call API
-        response = self.client.messages.create(
-            model=model or "claude-sonnet-4-20250514",
-            max_tokens=4096,
-            system=self._build_system_prompt(injected_context),
-            messages=messages,
-            temperature=self.spec.temperature,
+        # Stage 2: Cheap LLM pre-screen (Haiku, ~500 tokens) — only for Tier B agents.
+        # Avoids loading full context (up to 50K chars) just to get a rejection.
+        prescreen = self._llm_scope_prescreen(query)
+        if not prescreen["in_scope"]:
+            return AgentResponse(
+                content=prescreen["message"],
+                agent_id=self.spec.agent_id,
+                session_id=session.session_id,
+                tokens_used=prescreen.get("tokens_used", 0),
+                artifacts=[],
+                metadata={
+                    "scope_rejected": True,
+                    "rejection_method": "llm_prescreen",
+                    "suggested_agent": None,
+                },
+            )
+
+        # Stage 3: Full context load + main LLM call
+        tools_and_executor = self._get_domain_tools()
+        has_tools = tools_and_executor is not None
+
+        messages = self._build_messages(query, session)
+        system_prompt = self._build_system_prompt(
+            injected_context, tools_active=has_tools
         )
 
-        # Parse response
-        content = response.content[0].text
-        tokens_used = response.usage.input_tokens + response.usage.output_tokens
+        if tools_and_executor is None:
+            # Original single-shot path (no tools available)
+            response = self.client.messages.create(
+                model=model or "claude-opus-4-20250514",
+                max_tokens=4096,
+                system=system_prompt,
+                messages=messages,
+                temperature=self.spec.temperature,
+            )
+            content = response.content[0].text
+            tokens_used = response.usage.input_tokens + response.usage.output_tokens
+        else:
+            # Agentic tool-use path
+            tool_defs, executor = tools_and_executor
+            content, tokens_used = self._run_with_tools(
+                model=model or "claude-opus-4-20250514",
+                system_prompt=system_prompt,
+                messages=messages,
+                tool_defs=tool_defs,
+                executor=executor,
+                max_tool_tokens=max_tool_tokens,
+            )
 
         return AgentResponse(
             content=content,
@@ -169,18 +333,104 @@ class BaseAgent(ABC):
             session_id=session.session_id,
             tokens_used=tokens_used,
             artifacts=self._extract_artifacts(content),
+            metadata={"used_tools": has_tools},
         )
 
-    def _build_system_prompt(self, injected_context: str = "") -> str:
+    def _quick_scope_check(self, query: str) -> dict:
+        """Quick check if query is in this agent's scope without LLM call.
+
+        This is a cheap heuristic check to avoid expensive LLM calls for
+        queries that are clearly out of scope.
+
+        Args:
+            query: User's query to check.
+
+        Returns:
+            Dict with 'in_scope' bool, 'message' for rejection, and optional 'suggested_agent'.
+        """
+        # Default: assume in scope (let LLM decide)
+        # Subclasses can override for more specific checks
+        return {"in_scope": True, "message": ""}
+
+    def _llm_scope_prescreen(self, query: str) -> dict:
+        """Lightweight LLM scope check using Haiku with minimal context.
+
+        Uses only agent metadata (name, description, keywords, R&R) — roughly
+        500 input tokens — to decide if the query is in scope. This avoids
+        loading full context (up to 50K chars) for obviously out-of-scope queries.
+
+        Only runs for Tier B (auto-generated) agents. Tier A agents skip this
+        because they have better-targeted routing and manually curated scope.
+
+        Args:
+            query: User's query to check.
+
+        Returns:
+            Dict with 'in_scope' bool, 'message' str, and optional 'tokens_used' int.
+        """
+        # Only pre-screen auto-generated (Tier B) agents
+        if not self.spec.metadata.get("auto_generated"):
+            return {"in_scope": True, "message": ""}
+
+        # Build minimal prompt from metadata (no full context)
+        rnr = self.spec.metadata.get("rnr", {})
+        in_scope_items = rnr.get("in_scope", [])
+        out_of_scope_items = rnr.get("out_of_scope", [])
+
+        system = (
+            f"You are a routing classifier. Decide if a query belongs to agent '{self.spec.name}'.\n"
+            f"IN SCOPE: {', '.join(in_scope_items[:5]) if in_scope_items else self.spec.description}\n"
+            f"OUT OF SCOPE: {', '.join(out_of_scope_items[:5]) if out_of_scope_items else 'N/A'}\n"
+            f"Keywords: {', '.join(self.spec.context_keywords[:10])}\n\n"
+            f"Reply ONLY 'yes' or 'no'. Is this query in scope for this agent?"
+        )
+
+        try:
+            response = self.client.messages.create(
+                model="claude-opus-4-20250514",
+                max_tokens=10,
+                system=system,
+                messages=[{"role": "user", "content": query}],
+                temperature=0.0,
+            )
+            answer = response.content[0].text.strip().lower()
+            tokens_used = response.usage.input_tokens + response.usage.output_tokens
+
+            if answer.startswith("no"):
+                return {
+                    "in_scope": False,
+                    "message": (
+                        f"This question appears outside my area of expertise. "
+                        f"I handle {self.spec.name.lower()}."
+                    ),
+                    "tokens_used": tokens_used,
+                }
+            return {"in_scope": True, "message": "", "tokens_used": tokens_used}
+        except Exception:
+            # Fail open — on any error, assume in scope
+            return {"in_scope": True, "message": ""}
+
+    def _build_system_prompt(
+        self, injected_context: str = "", tools_active: bool = False,
+    ) -> str:
         """Combine spec prompt with context.
 
         Args:
             injected_context: Optional context from related agents.
+            tools_active: If True, reduce static context and add tool docs.
 
         Returns:
             Complete system prompt for the agent.
         """
-        context = self.get_context()
+        # When tools are active, reduce static context to leave room for tool results
+        if tools_active:
+            orig_max = self.spec.max_context_size
+            self.spec.max_context_size = min(orig_max, 20000)
+            context = self.get_context(force_refresh=True)
+            self.spec.max_context_size = orig_max
+        else:
+            context = self.get_context()
+
         base_prompt = self.spec.system_prompt or f"You are {self.spec.name}. {self.spec.description}"
 
         prompt = f"""{base_prompt}
@@ -195,11 +445,27 @@ class BaseAgent(ABC):
 {injected_context}
 """
 
+        if tools_active:
+            prompt += """## Available Tools
+
+You have tools to search and read files within your domain.
+Use them when the answer isn't fully covered in the pre-loaded context above.
+- **grep_domain**: search for regex patterns across your domain files
+- **read_file**: read the contents of a specific file
+- **list_files**: list files in a directory
+
+Strategy: First check if the pre-loaded context answers the question.
+If not, use grep_domain to find relevant files, then read_file to get details.
+Always note which files you found information in — your final answer MUST cite
+the specific file paths (e.g. `backend/app/services/insight.py`).
+"""
+
         prompt += """## Instructions
 
 - Focus only on your domain of expertise
 - If a query is outside your scope, say so clearly
-- Reference the context above when answering
+- **ALWAYS cite specific file paths** when referencing code (e.g. "in `backend/app/services/insight.py`", "the `PricingEngine` class in `backend/app/services/best_price.py`")
+- When describing implementations, name the exact source file, class, and method
 - Be concise but thorough
 """
         return prompt
@@ -251,6 +517,172 @@ class BaseAgent(ABC):
             )
 
         return artifacts
+
+    # =========================================================================
+    # Domain-scoped tool support
+    # =========================================================================
+
+    def _get_domain_tools(
+        self,
+    ) -> Optional[tuple[list[dict[str, Any]], "DomainToolExecutor"]]:
+        """Get domain tools if available for this agent.
+
+        Returns tool definitions + executor, or None if tools aren't
+        available (agent has no root_path or context_paths).
+        """
+        try:
+            from agenthub.agents.domain_tools import create_domain_tools
+
+            return create_domain_tools(self)
+        except Exception:
+            return None
+
+    def _run_with_tools(
+        self,
+        model: str,
+        system_prompt: str,
+        messages: list[dict],
+        tool_defs: list[dict[str, Any]],
+        executor: "DomainToolExecutor",
+        max_iterations: int = 5,
+        max_tool_tokens: int = 30000,
+    ) -> tuple[str, int]:
+        """Run the agentic tool-use loop.
+
+        Calls the LLM with tools, executes any requested tools, sends
+        results back, and repeats until the model produces a final answer
+        or budget/iteration limits are hit.
+
+        Returns:
+            Tuple of (final_text_content, total_tokens_used).
+        """
+        # Adaptive iteration cap: tighter budget → fewer iterations
+        if max_tool_tokens <= 15000:
+            max_iterations = min(max_iterations, 3)
+
+        total_tokens = 0
+
+        for iteration in range(max_iterations):
+            response = self.client.messages.create(
+                model=model,
+                max_tokens=4096,
+                system=system_prompt,
+                messages=messages,
+                tools=tool_defs,
+                temperature=self.spec.temperature,
+            )
+            total_tokens += (
+                response.usage.input_tokens + response.usage.output_tokens
+            )
+
+            # If the model is done, extract text and return
+            if response.stop_reason == "end_turn":
+                text = self._extract_text_from_content(response.content)
+                return text, total_tokens
+
+            # If the model wants to use tools
+            if response.stop_reason == "tool_use":
+                # Add assistant message with tool_use blocks.
+                # Convert Pydantic models to dicts to avoid serialization
+                # errors (by_alias) on subsequent API calls.
+                serialized_content = [
+                    block.model_dump() for block in response.content
+                ]
+                messages.append(
+                    {"role": "assistant", "content": serialized_content}
+                )
+
+                # Execute each tool and collect results
+                tool_results: list[dict[str, Any]] = []
+                for block in response.content:
+                    if block.type == "tool_use":
+                        logger.debug(
+                            f"Agent {self.spec.agent_id} calling "
+                            f"{block.name}({block.input})"
+                        )
+                        result = executor.execute(block.name, block.input)
+                        tool_results.append(
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": block.id,
+                                "content": result,
+                            }
+                        )
+
+                # Send tool results back
+                messages.append({"role": "user", "content": tool_results})
+
+            # Check token budget
+            if total_tokens >= max_tool_tokens:
+                logger.warning(
+                    f"Agent {self.spec.agent_id} hit tool token budget "
+                    f"({total_tokens}/{max_tool_tokens}) at iteration "
+                    f"{iteration + 1}"
+                )
+                break
+
+        # Loop exhausted or budget exceeded — force a final answer without tools.
+        # Add a nudge so the model summarises what it found instead of trying
+        # to call more tools.
+        logger.info(
+            f"Agent {self.spec.agent_id}: forcing final answer "
+            f"(tokens={total_tokens}, messages={len(messages)})"
+        )
+        messages.append({
+            "role": "user",
+            "content": (
+                "Please provide your final answer now based on what you've "
+                "found so far. Summarize the key findings concisely. "
+                "IMPORTANT: Always cite specific file paths (e.g. `backend/app/services/foo.py`) "
+                "when referencing code implementations."
+            ),
+        })
+        response = self.client.messages.create(
+            model=model,
+            max_tokens=4096,
+            system=system_prompt,
+            messages=messages,
+            temperature=self.spec.temperature,
+        )
+        total_tokens += (
+            response.usage.input_tokens + response.usage.output_tokens
+        )
+        text = self._extract_text_from_content(response.content)
+        if not text:
+            # Fallback: try to extract text from earlier tool-use responses
+            logger.warning(
+                f"Agent {self.spec.agent_id}: forced final answer was empty "
+                f"(stop_reason={response.stop_reason}, "
+                f"content_types={[b.type for b in response.content]})"
+            )
+            # Walk backwards through messages to find the last assistant text
+            for msg in reversed(messages):
+                if isinstance(msg, dict) and msg.get("role") == "assistant":
+                    content = msg.get("content", [])
+                    if isinstance(content, str):
+                        text = content
+                        break
+                    elif isinstance(content, list):
+                        extracted = self._extract_text_from_content(content)
+                        if extracted:
+                            text = extracted
+                            break
+        return text, total_tokens
+
+    @staticmethod
+    def _extract_text_from_content(content: list) -> str:
+        """Extract text from a list of content blocks.
+
+        Handles both Pydantic model objects (from API responses) and
+        plain dicts (from serialized messages).
+        """
+        parts = []
+        for block in content:
+            if hasattr(block, "text"):
+                parts.append(block.text)
+            elif isinstance(block, dict) and block.get("type") == "text":
+                parts.append(block["text"])
+        return "\n".join(parts) if parts else ""
 
     def __repr__(self) -> str:
         return f"<{self.__class__.__name__} id={self.spec.agent_id!r}>"
@@ -350,7 +782,7 @@ class BaseAgent(ABC):
 
         # Call the LLM
         response = self.client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-opus-4-20250514",
             max_tokens=4096,
             system=self._build_analysis_system_prompt(),
             messages=[{"role": "user", "content": prompt}],

@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Cross-agent context injection for enhanced query responses.
 
 When an agent's code imports from another agent's domain, this module

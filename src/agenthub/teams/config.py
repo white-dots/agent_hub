@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Configuration for DAG team execution.
 
 This module provides configuration options for controlling how
@@ -59,13 +60,13 @@ class TeamConfig:
 
     # Execution
     max_parallel: int = 4
-    agent_timeout_seconds: float = 30.0
-    total_timeout_seconds: float = 120.0
+    agent_timeout_seconds: float = 120.0
+    total_timeout_seconds: float = 300.0
 
     # Models
-    decomposer_model: str = "claude-haiku-4-5-20251001"
-    synthesizer_model: str = "claude-sonnet-4-20250514"
+    decomposer_model: str = "claude-opus-4-20250514"
+    synthesizer_model: str = "claude-opus-4-20250514"
 
     # Cost control
-    max_total_tokens: int = 50000
+    max_total_tokens: int = 200000
     skip_synthesis_if_single: bool = True

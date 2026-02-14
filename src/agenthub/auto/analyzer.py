@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Codebase analyzer for auto-agent generation."""
 
 import fnmatch

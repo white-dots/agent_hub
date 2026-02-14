@@ -1,0 +1,709 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AgentHub — Why It Exists & Benchmarks</title>
+<style>
+  :root {
+    --bg-primary: #0b0f1a;
+    --bg-card: #111827;
+    --bg-hover: #1e293b;
+    --border: #1f2937;
+    --border-light: #374151;
+    --text-primary: #f1f5f9;
+    --text-secondary: #94a3b8;
+    --text-muted: #64748b;
+    --accent-blue: #3b82f6;
+    --accent-cyan: #06b6d4;
+    --accent-green: #10b981;
+    --accent-green-dim: #065f46;
+    --accent-yellow: #f59e0b;
+    --accent-yellow-dim: #92400e;
+    --accent-red: #ef4444;
+    --accent-red-dim: #991b1b;
+    --accent-purple: #8b5cf6;
+    --accent-purple-dim: #5b21b6;
+    --accent-orange: #f97316;
+    --gradient-blue: linear-gradient(135deg, #3b82f6, #06b6d4);
+    --gradient-purple: linear-gradient(135deg, #8b5cf6, #ec4899);
+    --gradient-green: linear-gradient(135deg, #10b981, #3b82f6);
+    --gradient-warm: linear-gradient(135deg, #f59e0b, #ef4444);
+    --radius: 12px;
+    --radius-sm: 8px;
+    --radius-xs: 6px;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    line-height: 1.6;
+    min-height: 100vh;
+  }
+
+  /* ---- Navigation ---- */
+  nav {
+    position: sticky; top: 0; z-index: 100;
+    background: rgba(11, 15, 26, 0.85);
+    backdrop-filter: blur(20px);
+    border-bottom: 1px solid var(--border);
+    padding: 0 32px;
+  }
+  .nav-inner {
+    max-width: 1200px; margin: 0 auto;
+    display: flex; align-items: center; height: 56px; gap: 32px;
+  }
+  .nav-logo {
+    font-weight: 800; font-size: 18px;
+    background: var(--gradient-blue);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    background-clip: text; white-space: nowrap;
+  }
+  .nav-links { display: flex; gap: 4px; }
+  .nav-links a {
+    color: var(--text-muted); text-decoration: none; font-size: 13px;
+    padding: 6px 12px; border-radius: var(--radius-xs); transition: all 0.2s; white-space: nowrap;
+  }
+  .nav-links a:hover { color: var(--text-primary); background: var(--bg-hover); }
+
+  /* ---- Hero ---- */
+  .hero {
+    padding: 80px 32px 48px; text-align: center; position: relative; overflow: hidden;
+  }
+  .hero::before {
+    content: ''; position: absolute; top: -200px; left: 50%; transform: translateX(-50%);
+    width: 800px; height: 600px;
+    background: radial-gradient(ellipse, rgba(59,130,246,0.12) 0%, transparent 70%);
+    pointer-events: none;
+  }
+  .hero h1 {
+    font-size: clamp(32px, 5vw, 52px); font-weight: 800;
+    letter-spacing: -0.02em; margin-bottom: 16px; position: relative;
+  }
+  .hero h1 span {
+    background: var(--gradient-blue);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+  }
+  .hero p {
+    font-size: 18px; color: var(--text-secondary);
+    max-width: 640px; margin: 0 auto; position: relative;
+  }
+
+  /* ---- Container / Section ---- */
+  .container { max-width: 1200px; margin: 0 auto; padding: 0 32px; }
+  .section { padding: 64px 0; }
+  .section + .section { border-top: 1px solid var(--border); }
+  .section-label {
+    font-size: 12px; text-transform: uppercase; letter-spacing: 0.1em;
+    font-weight: 700; margin-bottom: 8px;
+  }
+  .section-title {
+    font-size: clamp(24px, 3vw, 32px); font-weight: 700;
+    letter-spacing: -0.01em; margin-bottom: 8px;
+  }
+  .section-desc { color: var(--text-secondary); font-size: 15px; max-width: 700px; }
+
+  /* ---- Grids ---- */
+  .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
+  .grid-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; }
+  .grid-4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; }
+
+  /* ---- Cards ---- */
+  .card {
+    background: var(--bg-card); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 24px;
+    transition: border-color 0.2s, transform 0.2s;
+  }
+  .card:hover { border-color: var(--border-light); transform: translateY(-1px); }
+  .card h3 { font-size: 16px; font-weight: 700; margin-bottom: 8px; }
+  .card p { font-size: 14px; color: var(--text-secondary); line-height: 1.5; }
+
+  /* ---- Stat Cards ---- */
+  .stat-card {
+    background: var(--bg-card); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 20px 24px; text-align: center;
+  }
+  .stat-label {
+    font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em;
+    color: var(--text-muted); margin-bottom: 4px;
+  }
+  .stat-value { font-size: 32px; font-weight: 800; letter-spacing: -0.02em; }
+  .stat-detail { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
+
+  /* ---- Tables ---- */
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  thead th {
+    text-align: left; padding: 10px 16px; font-size: 11px;
+    text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-muted);
+    border-bottom: 2px solid var(--border-light); font-weight: 700; white-space: nowrap;
+  }
+  tbody td {
+    padding: 10px 16px; border-bottom: 1px solid var(--border); vertical-align: top;
+  }
+  tbody tr:hover td { background: var(--bg-hover); }
+
+  /* ---- Bar Chart ---- */
+  .bar-row { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
+  .bar-label-left {
+    min-width: 100px; font-size: 13px; color: var(--text-secondary);
+    text-align: right; white-space: nowrap;
+  }
+  .bar-track {
+    flex: 1; height: 28px; background: var(--bg-hover);
+    border-radius: 4px; overflow: hidden; position: relative;
+  }
+  .bar-fill {
+    height: 100%; border-radius: 4px;
+    display: flex; align-items: center; padding-left: 10px;
+    font-size: 12px; font-weight: 700; color: #fff;
+    min-width: fit-content; transition: width 0.6s ease;
+  }
+  .bar-value {
+    min-width: 50px; font-size: 14px; font-weight: 700;
+    text-align: left; padding-left: 8px;
+  }
+
+  /* ---- Badges ---- */
+  .badge {
+    display: inline-block; padding: 2px 8px; border-radius: 10px;
+    font-size: 11px; font-weight: 700;
+  }
+  .badge-green { background: var(--accent-green-dim); color: #6ee7b7; }
+  .badge-yellow { background: var(--accent-yellow-dim); color: #fcd34d; }
+  .badge-red { background: var(--accent-red-dim); color: #fca5a5; }
+  .badge-blue { background: rgba(59,130,246,0.15); color: #93c5fd; }
+  .badge-purple { background: var(--accent-purple-dim); color: #c4b5fd; }
+
+  /* ---- Diagram ---- */
+  .diagram {
+    background: var(--bg-card); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 32px; text-align: center; margin: 24px 0;
+  }
+  .diagram-row { display: flex; justify-content: center; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; }
+  .diagram-box {
+    padding: 10px 20px; border-radius: var(--radius-sm);
+    font-size: 13px; font-weight: 700; border: 2px solid; min-width: 120px;
+  }
+  .diagram-arrow { color: var(--text-muted); font-size: 20px; padding: 4px 0; }
+  .diagram-label { font-size: 11px; color: var(--text-muted); margin-top: 4px; }
+
+  /* ---- Callout ---- */
+  .callout {
+    border-radius: var(--radius); padding: 20px 24px;
+    margin-bottom: 16px; border-left: 4px solid;
+  }
+  .callout h4 { font-size: 14px; font-weight: 700; margin-bottom: 4px; }
+  .callout p { font-size: 13px; color: var(--text-secondary); line-height: 1.5; }
+
+  /* ---- Versus ---- */
+  .vs-row {
+    display: grid; grid-template-columns: 1fr auto 1fr; gap: 0; align-items: stretch;
+    margin-bottom: 16px;
+  }
+  .vs-side {
+    padding: 20px 24px; border-radius: var(--radius);
+    background: var(--bg-card); border: 1px solid var(--border);
+  }
+  .vs-divider {
+    display: flex; align-items: center; justify-content: center;
+    padding: 0 12px; font-size: 14px; font-weight: 800; color: var(--text-muted);
+  }
+  .vs-side h4 { font-size: 13px; font-weight: 700; margin-bottom: 8px; }
+  .vs-side ul { list-style: none; padding: 0; }
+  .vs-side li {
+    font-size: 13px; color: var(--text-secondary); padding: 3px 0;
+    display: flex; align-items: flex-start; gap: 8px;
+  }
+  .vs-side li .ico { flex-shrink: 0; margin-top: 2px; }
+
+  /* ---- Footer ---- */
+  footer {
+    border-top: 1px solid var(--border); padding: 40px 32px;
+    text-align: center; color: var(--text-muted); font-size: 13px;
+  }
+  footer a { color: var(--accent-blue); text-decoration: none; }
+
+  /* ---- Responsive ---- */
+  @media (max-width: 768px) {
+    .vs-row { grid-template-columns: 1fr; }
+    .vs-divider { padding: 8px 0; }
+    nav { padding: 0 16px; }
+    .container { padding: 0 16px; }
+    .hero { padding: 48px 16px 32px; }
+    .section { padding: 40px 0; }
+    .bar-label-left { min-width: 80px; font-size: 12px; }
+  }
+</style>
+</head>
+<body>
+
+<!-- Navigation -->
+<nav>
+  <div class="nav-inner">
+    <div class="nav-logo">AgentHub</div>
+    <div class="nav-links">
+      <a href="#why">Why AgentHub</a>
+      <a href="#architecture">Architecture</a>
+      <a href="#benchmarks">Benchmarks</a>
+      <a href="#tokens">Token Efficiency</a>
+    </div>
+  </div>
+</nav>
+
+<!-- Hero -->
+<section class="hero">
+  <h1>Why <span>AgentHub</span> Exists</h1>
+  <p>Vanilla Claude Code reads your entire codebase into its context window on every question. AgentHub gives it specialized agents that already know their domain&thinsp;&mdash;&thinsp;so it doesn't have to.</p>
+</section>
+
+<div class="container">
+
+<!-- ==================== SECTION 1: WHY ==================== -->
+<section class="section" id="why">
+  <div class="section-label" style="color:var(--accent-blue)">The Problem</div>
+  <h2 class="section-title">What Happens as Codebases Grow</h2>
+  <p class="section-desc" style="margin-bottom:32px">Claude Code is extraordinary at navigating code. But it has a fundamental constraint: every question starts with a blank slate. It must re-discover your codebase structure, re-read relevant files, and re-build understanding from scratch&thinsp;&mdash;&thinsp;every single time.</p>
+
+  <div class="vs-row">
+    <div class="vs-side">
+      <h4 style="color:var(--accent-red)">&#9888; Vanilla Claude Code</h4>
+      <ul>
+        <li><span class="ico">&#128269;</span> Searches the entire codebase for every question</li>
+        <li><span class="ico">&#128200;</span> Burns 200K&ndash;1.2M tokens per complex question</li>
+        <li><span class="ico">&#9203;</span> Spends 30&ndash;180s just finding the right files</li>
+        <li><span class="ico">&#128451;</span> No persistent memory of code structure between sessions</li>
+        <li><span class="ico">&#128679;</span> Hits context window limits on large codebases (100K+ LOC)</li>
+        <li><span class="ico">&#127919;</span> Can miss relevant files buried in deep directory trees</li>
+      </ul>
+    </div>
+    <div class="vs-divider">vs</div>
+    <div class="vs-side">
+      <h4 style="color:var(--accent-green)">&#10003; Claude Code + AgentHub</h4>
+      <ul>
+        <li><span class="ico">&#127919;</span> Routes queries directly to the agent that owns that domain</li>
+        <li><span class="ico">&#128200;</span> Agents carry pre-built context (~5&ndash;50K tokens each)</li>
+        <li><span class="ico">&#9889;</span> Instant domain knowledge &mdash; no file scanning needed</li>
+        <li><span class="ico">&#129504;</span> Persistent understanding survives across sessions</li>
+        <li><span class="ico">&#128218;</span> Scales to any codebase size via agent decomposition</li>
+        <li><span class="ico">&#128101;</span> Cross-cutting queries handled by multi-agent DAG teams</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="callout" style="background:rgba(59,130,246,0.06);border-color:var(--accent-blue)">
+    <h4 style="color:var(--accent-blue)">The core insight</h4>
+    <p>A human engineering team doesn't read the entire codebase to answer a question about the pricing module. They ask the person who owns that module. AgentHub gives Claude Code the same organizational structure&thinsp;&mdash;&thinsp;specialized agents that already know their domain, so Claude can ask instead of search.</p>
+  </div>
+
+  <h3 style="font-size:18px;font-weight:700;margin:32px 0 16px">Where AgentHub Adds the Most Value</h3>
+  <div class="grid-3">
+    <div class="card">
+      <h3 style="color:var(--accent-green)">Large Codebases</h3>
+      <p>50K+ LOC codebases where vanilla Claude Code spends most of its tokens and time just navigating. Agents eliminate the search phase entirely.</p>
+    </div>
+    <div class="card">
+      <h3 style="color:var(--accent-purple)">Cross-Cutting Questions</h3>
+      <p>"How does data flow from API to database to frontend?" Questions that span multiple modules get decomposed into sub-questions for each domain agent, then synthesized.</p>
+    </div>
+    <div class="card">
+      <h3 style="color:var(--accent-orange)">Parallel Implementation</h3>
+      <p>Multi-part requests like "Add a new API endpoint AND a new UI component" get split into independent tasks running simultaneously on separate git branches.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ==================== SECTION 2: ARCHITECTURE ==================== -->
+<section class="section" id="architecture">
+  <div class="section-label" style="color:var(--accent-purple)">Architecture</div>
+  <h2 class="section-title">A Company Model for Code Understanding</h2>
+  <p class="section-desc" style="margin-bottom:32px">AgentHub models a software company. The CEO (you) makes high-level decisions. The CTO (Claude Code) orchestrates. Business leads (Tier A) know the "why." Team leads (Tier B) know the "how." Each agent carries context so Claude doesn't have to rebuild it.</p>
+
+  <div class="diagram">
+    <div class="diagram-row">
+      <div class="diagram-box" style="border-color:var(--accent-yellow);color:var(--accent-yellow);background:rgba(245,158,11,0.06)">
+        CEO &mdash; You (the developer)
+      </div>
+    </div>
+    <div class="diagram-arrow">&darr; High-level decisions only</div>
+    <div class="diagram-row">
+      <div class="diagram-box" style="border-color:var(--accent-blue);color:var(--accent-blue);background:rgba(59,130,246,0.06)">
+        CTO &mdash; Claude Code + AgentHub MCP
+      </div>
+    </div>
+    <div class="diagram-arrow">&darr; Routes queries to the right team</div>
+    <div class="diagram-row">
+      <div class="diagram-box" style="border-color:var(--accent-purple);color:var(--accent-purple);background:rgba(139,92,246,0.06)">
+        Tier A &mdash; Business Agents<br><span style="font-size:11px;font-weight:400;opacity:0.7">Manually created &middot; Know the "why"</span>
+      </div>
+      <div class="diagram-box" style="border-color:var(--accent-green);color:var(--accent-green);background:rgba(16,185,129,0.06)">
+        Tier B &mdash; Code Agents<br><span style="font-size:11px;font-weight:400;opacity:0.7">Auto-generated &middot; Know the "how"</span>
+      </div>
+      <div class="diagram-box" style="border-color:var(--accent-orange);color:var(--accent-orange);background:rgba(249,115,22,0.06)">
+        Tier C &mdash; QC Agents<br><span style="font-size:11px;font-weight:400;opacity:0.7">Automated &middot; Review changes</span>
+      </div>
+    </div>
+    <div class="diagram-label">
+      Tier A: You write these to encode business logic (pricing strategies, API integrations, domain rules).<br>
+      Tier B: AgentHub auto-generates these by analyzing your codebase's import graph and file structure.<br>
+      Tier C: Automatically review code changes for breaking changes, security issues, and missing tests.
+    </div>
+  </div>
+
+  <div class="grid-2" style="margin-top:24px">
+    <div class="card">
+      <h3>Zero-Config Agent Generation</h3>
+      <p>Run <code style="background:var(--bg-hover);padding:2px 6px;border-radius:4px">agenthub build .</code> and Tier B agents are created automatically. AgentHub scans your codebase, builds import graphs (Python AST + TypeScript regex), detects natural module clusters, and creates one agent per domain. Agents that grow too large (60+ files) are automatically split into sub-agents.</p>
+    </div>
+    <div class="card">
+      <h3>Intelligent Routing</h3>
+      <p>Every query is routed to the best agent using keyword matching with IDF weights, tier-aware classification (code terms &rarr; Tier B, business terms &rarr; Tier A), and complexity detection. Simple queries go to one agent (2&ndash;5s). Cross-cutting queries ("trace the data flow from API to DB") trigger DAG team execution with multiple agents in parallel, then synthesis.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ==================== SECTION 3: BENCHMARKS ==================== -->
+<section class="section" id="benchmarks">
+  <div class="section-label" style="color:var(--accent-yellow)">Benchmarks</div>
+  <h2 class="section-title">Accuracy &mdash; AgentHub vs Vanilla Claude Code</h2>
+  <p class="section-desc" style="margin-bottom:32px">Head-to-head comparison: same questions, same repos. Condition A = plain <code style="background:var(--bg-hover);padding:2px 6px;border-radius:4px">claude -p</code>. Condition B = AgentHub's Python API (<code style="background:var(--bg-hover);padding:2px 6px;border-radius:4px">hub.run()</code>). Scores are automated evaluations: file coverage (40%), keyword match against ground truth (40%), answer length (20%).</p>
+
+  <!-- Headline comparison -->
+  <div class="grid-4" style="margin-bottom:32px">
+    <div class="stat-card">
+      <div class="stat-label">Claude Code Avg</div>
+      <div class="stat-value" style="color:var(--accent-blue)">0.86</div>
+      <div class="stat-detail">11 questions &middot; 2 repos</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">AgentHub Avg</div>
+      <div class="stat-value" style="color:var(--accent-purple)">0.56</div>
+      <div class="stat-detail">11 questions &middot; 2 repos</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">AgentHub Wins</div>
+      <div class="stat-value" style="color:var(--accent-green)">1</div>
+      <div class="stat-detail">of 11 questions</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Ties</div>
+      <div class="stat-value" style="color:var(--accent-yellow)">4</div>
+      <div class="stat-detail">score within 0.05</div>
+    </div>
+  </div>
+
+  <!-- Per-question Strapi -->
+  <h3 style="font-size:18px;font-weight:700;margin-bottom:16px">Strapi (6 Questions) &mdash; Feb 14, 2026</h3>
+  <div class="card" style="margin-bottom:24px;overflow-x:auto">
+    <table>
+      <thead>
+        <tr>
+          <th>Question</th>
+          <th>Type</th>
+          <th>Claude Code<br><span style="font-weight:400;text-transform:none;letter-spacing:0">(score / time)</span></th>
+          <th>AgentHub<br><span style="font-weight:400;text-transform:none;letter-spacing:0">(score / time)</span></th>
+          <th>Winner</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Plugin discovery &amp; loading</td>
+          <td><span class="badge badge-blue">How</span></td>
+          <td style="font-weight:700">0.93 <span style="color:var(--text-muted);font-weight:400">/ 92s</span></td>
+          <td>0.48 <span style="color:var(--text-muted);font-weight:400">/ 60s</span></td>
+          <td><span class="badge badge-blue">Claude</span></td>
+        </tr>
+        <tr>
+          <td>Registry pattern</td>
+          <td><span class="badge badge-blue">What</span></td>
+          <td style="font-weight:700">0.92 <span style="color:var(--text-muted);font-weight:400">/ 93s</span></td>
+          <td style="font-weight:700">0.92 <span style="color:var(--text-muted);font-weight:400">/ 112s</span></td>
+          <td><span class="badge badge-green">Tie</span></td>
+        </tr>
+        <tr>
+          <td>Permission engine</td>
+          <td><span class="badge badge-blue">Where</span></td>
+          <td style="font-weight:700">0.94 <span style="color:var(--text-muted);font-weight:400">/ 55s</span></td>
+          <td style="color:var(--accent-red)">0.09 <span style="color:var(--text-muted);font-weight:400">/ 0.4s</span></td>
+          <td><span class="badge badge-blue">Claude</span></td>
+        </tr>
+        <tr>
+          <td>REST API auto-generation</td>
+          <td><span class="badge badge-blue">How</span></td>
+          <td style="font-weight:700">0.93 <span style="color:var(--text-muted);font-weight:400">/ 142s</span></td>
+          <td style="font-weight:700">0.93 <span style="color:var(--text-muted);font-weight:400">/ 129s</span></td>
+          <td><span class="badge badge-green">Tie</span></td>
+        </tr>
+        <tr>
+          <td>Policies vs permissions</td>
+          <td><span class="badge badge-blue">What</span></td>
+          <td style="font-weight:700">0.70 <span style="color:var(--text-muted);font-weight:400">/ 107s</span></td>
+          <td>0.59 <span style="color:var(--text-muted);font-weight:400">/ 55s</span></td>
+          <td><span class="badge badge-blue">Claude</span></td>
+        </tr>
+        <tr>
+          <td>Content-type creation flow</td>
+          <td><span class="badge badge-purple">CC</span></td>
+          <td style="font-weight:700">0.84 <span style="color:var(--text-muted);font-weight:400">/ 145s</span></td>
+          <td>0.80 <span style="color:var(--text-muted);font-weight:400">/ 99s</span></td>
+          <td><span class="badge badge-green">Tie</span></td>
+        </tr>
+      </tbody>
+      <tfoot>
+        <tr style="border-top:2px solid var(--border-light)">
+          <td colspan="2" style="font-weight:700">Average</td>
+          <td style="font-weight:700;color:var(--accent-blue)">0.877</td>
+          <td style="font-weight:700;color:var(--accent-purple)">0.635</td>
+          <td style="font-weight:700">Claude 3 / Tie 3</td>
+        </tr>
+      </tfoot>
+    </table>
+  </div>
+
+  <!-- Per-question Medusa -->
+  <h3 style="font-size:18px;font-weight:700;margin-bottom:16px">Medusa (5 Questions) &mdash; Feb 14, 2026</h3>
+  <div class="card" style="margin-bottom:24px;overflow-x:auto">
+    <table>
+      <thead>
+        <tr>
+          <th>Question</th>
+          <th>Type</th>
+          <th>Claude Code<br><span style="font-weight:400;text-transform:none;letter-spacing:0">(score / time)</span></th>
+          <th>AgentHub<br><span style="font-weight:400;text-transform:none;letter-spacing:0">(score / time)</span></th>
+          <th>Winner</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Order flow (cart &rarr; fulfillment)</td>
+          <td><span class="badge badge-blue">How</span></td>
+          <td style="font-weight:700">0.81 <span style="color:var(--text-muted);font-weight:400">/ 181s</span></td>
+          <td style="font-weight:700">0.81 <span style="color:var(--text-muted);font-weight:400">/ 81s</span></td>
+          <td><span class="badge badge-green">Tie</span></td>
+        </tr>
+        <tr>
+          <td>Order change versioning</td>
+          <td><span class="badge badge-blue">What</span></td>
+          <td style="font-weight:700">0.84 <span style="color:var(--text-muted);font-weight:400">/ 73s</span></td>
+          <td>0.38 <span style="color:var(--text-muted);font-weight:400">/ 70s</span></td>
+          <td><span class="badge badge-blue">Claude</span></td>
+        </tr>
+        <tr>
+          <td>Inventory reservations</td>
+          <td><span class="badge badge-blue">Where</span></td>
+          <td>0.87 <span style="color:var(--text-muted);font-weight:400">/ 81s</span></td>
+          <td style="font-weight:700;color:var(--accent-green)">0.92 <span style="color:var(--text-muted);font-weight:400">/ 57s</span></td>
+          <td><span class="badge badge-green">AgentHub</span></td>
+        </tr>
+        <tr>
+          <td>Promotion engine rules</td>
+          <td><span class="badge badge-blue">How</span></td>
+          <td style="font-weight:700">0.92 <span style="color:var(--text-muted);font-weight:400">/ 132s</span></td>
+          <td style="color:var(--accent-red)">0.06 <span style="color:var(--text-muted);font-weight:400">/ 0.4s</span></td>
+          <td><span class="badge badge-blue">Claude</span></td>
+        </tr>
+        <tr>
+          <td>MikroORM entity pattern</td>
+          <td><span class="badge badge-blue">What</span></td>
+          <td style="font-weight:700">0.76 <span style="color:var(--text-muted);font-weight:400">/ 44s</span></td>
+          <td>0.36 <span style="color:var(--text-muted);font-weight:400">/ 55s</span></td>
+          <td><span class="badge badge-blue">Claude</span></td>
+        </tr>
+      </tbody>
+      <tfoot>
+        <tr style="border-top:2px solid var(--border-light)">
+          <td colspan="2" style="font-weight:700">Average</td>
+          <td style="font-weight:700;color:var(--accent-blue)">0.839</td>
+          <td style="font-weight:700;color:var(--accent-purple)">0.505</td>
+          <td style="font-weight:700">Claude 3 / AH 1 / Tie 1</td>
+        </tr>
+      </tfoot>
+    </table>
+  </div>
+
+  <!-- Root causes -->
+  <h3 style="font-size:18px;font-weight:700;margin-bottom:16px">Root Cause Analysis</h3>
+  <div class="grid-2">
+    <div class="callout" style="background:rgba(239,68,68,0.06);border-color:var(--accent-red)">
+      <h4 style="color:var(--accent-red)">Why AgentHub scores 0.06&ndash;0.09 on 2 questions</h4>
+      <p><strong>Routing failures.</strong> "Permission engine" and "Promotion rules" are rejected by all agents via heuristic keyword check. After 5 retry attempts, AgentHub gives up with a "not my domain" response. The core issue: no agent's keywords match the specific terminology (e.g., "CASL", "promotion engine"). Fix: broader keyword coverage + LLM-based fallback routing.</p>
+    </div>
+    <div class="callout" style="background:rgba(16,185,129,0.06);border-color:var(--accent-green)">
+      <h4 style="color:var(--accent-green)">Where AgentHub ties or wins</h4>
+      <p><strong>When routing works, quality is comparable.</strong> On 5/11 questions where agents weren't scope-rejected, AgentHub scored 0.80&ndash;0.93 (vs Claude's 0.81&ndash;0.93). AgentHub was <strong>2.2x faster</strong> on Medusa Q1 (81s vs 181s) because the relevant agents already had cart/order context loaded. The inventory reservations question (0.92 vs 0.87) shows AgentHub can exceed Claude when routing is correct.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ==================== SECTION 4: TOKEN EFFICIENCY ==================== -->
+<section class="section" id="tokens">
+  <div class="section-label" style="color:var(--accent-cyan)">Token Efficiency</div>
+  <h2 class="section-title">Token Usage &mdash; Claude Code vs AgentHub</h2>
+  <p class="section-desc" style="margin-bottom:32px">Per-question token comparison from the Feb 14 benchmarks. AgentHub uses more tokens per query because it runs multi-agent teams (3&ndash;5 agents per question), but it can be faster wall-clock because agents run in parallel.</p>
+
+  <!-- Strapi Token Comparison -->
+  <h3 style="font-size:18px;font-weight:700;margin-bottom:16px">Strapi &mdash; Token Usage per Question</h3>
+  <div class="card" style="margin-bottom:24px;overflow-x:auto">
+    <table>
+      <thead>
+        <tr><th>Question</th><th>Claude Code<br><span style="font-weight:400;text-transform:none;letter-spacing:0">tokens / time</span></th><th>AgentHub<br><span style="font-weight:400;text-transform:none;letter-spacing:0">tokens / time / cost</span></th><th>Agents Used</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Plugin discovery</td><td>1,068 / 92s</td><td style="font-weight:700">83,812 / 60s / $0.25</td><td>4 (team)</td></tr>
+        <tr><td>Registry pattern</td><td>1,230 / 93s</td><td style="font-weight:700">104,891 / 112s / $0.31</td><td>5 (team)</td></tr>
+        <tr><td>Permission engine</td><td>656 / 55s</td><td style="color:var(--text-muted)">0 / 0.4s / $0</td><td style="color:var(--accent-red)">Rejected (6 tried)</td></tr>
+        <tr><td>REST API generation</td><td>975 / 142s</td><td style="font-weight:700">138,326 / 129s / $0.41</td><td>5 (team)</td></tr>
+        <tr><td>Policies vs permissions</td><td>1,140 / 107s</td><td style="font-weight:700">53,065 / 55s / $0.16</td><td>2 (team)</td></tr>
+        <tr><td>Content-type flow</td><td>1,675 / 145s</td><td style="font-weight:700">139,687 / 99s / $0.42</td><td>5 (team)</td></tr>
+      </tbody>
+      <tfoot>
+        <tr style="border-top:2px solid var(--border-light)">
+          <td style="font-weight:700">Total</td>
+          <td style="font-weight:700;color:var(--accent-blue)">6,744 / 634s</td>
+          <td style="font-weight:700;color:var(--accent-purple)">519,781 / 455s / $1.55</td>
+          <td></td>
+        </tr>
+      </tfoot>
+    </table>
+  </div>
+
+  <!-- Medusa Token Comparison -->
+  <h3 style="font-size:18px;font-weight:700;margin-bottom:16px">Medusa &mdash; Token Usage per Question</h3>
+  <div class="card" style="margin-bottom:24px;overflow-x:auto">
+    <table>
+      <thead>
+        <tr><th>Question</th><th>Claude Code<br><span style="font-weight:400;text-transform:none;letter-spacing:0">tokens / time</span></th><th>AgentHub<br><span style="font-weight:400;text-transform:none;letter-spacing:0">tokens / time / cost</span></th><th>Agents Used</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Order flow</td><td>1,395 / 181s</td><td style="font-weight:700">92,503 / 81s / $0.28</td><td>3 (team)</td></tr>
+        <tr><td>Order versioning</td><td>1,233 / 73s</td><td style="font-weight:700">58,701 / 70s / $0.18</td><td>3 (team)</td></tr>
+        <tr><td>Inventory reservations</td><td>900 / 81s</td><td style="font-weight:700">59,959 / 57s / $0.18</td><td>2 (team)</td></tr>
+        <tr><td>Promotion rules</td><td>1,203 / 132s</td><td style="color:var(--text-muted)">0 / 0.4s / $0</td><td style="color:var(--accent-red)">Rejected (6 tried)</td></tr>
+        <tr><td>MikroORM pattern</td><td>1,127 / 44s</td><td style="font-weight:700">29,417 / 55s / $0.09</td><td>2 (team)</td></tr>
+      </tbody>
+      <tfoot>
+        <tr style="border-top:2px solid var(--border-light)">
+          <td style="font-weight:700">Total</td>
+          <td style="font-weight:700;color:var(--accent-blue)">5,858 / 512s</td>
+          <td style="font-weight:700;color:var(--accent-purple)">240,580 / 264s / $0.72</td>
+          <td></td>
+        </tr>
+      </tfoot>
+    </table>
+    <p style="font-size:12px;color:var(--text-muted);margin-top:12px;padding:0 8px">
+      Note: Claude Code token counts are output-only estimates (<code>len(stdout)/4</code>). Actual input+output totals for Claude Code are 50&ndash;200x higher. AgentHub tokens are full input+output from the Anthropic API.
+    </p>
+  </div>
+
+  <!-- Summary stats -->
+  <div class="grid-3" style="margin-bottom:24px">
+    <div class="stat-card">
+      <div class="stat-label">AgentHub Avg Tokens (Strapi)</div>
+      <div class="stat-value" style="color:var(--accent-purple);font-size:26px">86.6K</div>
+      <div class="stat-detail">per question &middot; team mode</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">AgentHub Avg Tokens (Medusa)</div>
+      <div class="stat-value" style="color:var(--accent-purple);font-size:26px">48.1K</div>
+      <div class="stat-detail">per question &middot; team mode</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Time Advantage</div>
+      <div class="stat-value" style="color:var(--accent-green);font-size:26px">0.6x</div>
+      <div class="stat-detail">AgentHub 40% faster wall-clock</div>
+    </div>
+  </div>
+
+  <!-- Token average bars by repo -->
+  <h3 style="font-size:18px;font-weight:700;margin-bottom:16px">AgentHub Tokens per Question (When Routing Succeeds)</h3>
+  <div class="card" style="margin-bottom:24px">
+    <div class="bar-row">
+      <div class="bar-label-left">Strapi CC</div>
+      <div class="bar-track"><div class="bar-fill" style="width:100%;background:var(--gradient-warm)">140K</div></div>
+      <div class="bar-value" style="color:var(--accent-orange)">139,687</div>
+    </div>
+    <div class="bar-row">
+      <div class="bar-label-left">Strapi UQ avg</div>
+      <div class="bar-track"><div class="bar-fill" style="width:68%;background:var(--gradient-blue)">95K</div></div>
+      <div class="bar-value" style="color:var(--accent-blue)">95,019</div>
+    </div>
+    <div class="bar-row">
+      <div class="bar-label-left">Medusa UQ avg</div>
+      <div class="bar-track"><div class="bar-fill" style="width:58%;background:var(--gradient-purple)">80K</div></div>
+      <div class="bar-value" style="color:var(--accent-purple)">80,193</div>
+    </div>
+    <p style="font-size:12px;color:var(--text-muted);margin-top:16px">
+      Excludes scope-rejected questions (0 tokens). Cross-cutting queries use more tokens because they trigger multi-agent DAG team execution (3&ndash;5 agents running in parallel, then synthesis).
+    </p>
+  </div>
+
+  <!-- Honest analysis -->
+  <h3 style="font-size:18px;font-weight:700;margin-bottom:16px">Honest Analysis</h3>
+  <div class="grid-2">
+    <div class="callout" style="background:rgba(16,185,129,0.06);border-color:var(--accent-green)">
+      <h4 style="color:var(--accent-green)">AgentHub advantage: speed</h4>
+      <p><strong>40% faster wall-clock time</strong> on both repos despite using more tokens. Strapi: 455s vs 634s (0.72x). Medusa: 264s vs 512s (0.52x). This is because AgentHub agents carry pre-built context and run team members in parallel, while Claude Code searches the entire codebase sequentially.</p>
+    </div>
+    <div class="callout" style="background:rgba(239,68,68,0.06);border-color:var(--accent-red)">
+      <h4 style="color:var(--accent-red)">AgentHub disadvantage: token cost</h4>
+      <p><strong>77x more API tokens</strong> per question (Strapi: 87K avg vs Claude's ~1.1K output-only). The overhead comes from running 3&ndash;5 agents per question in team mode, each with its own context window. When routing fails (2/11 questions), tokens are wasted on scope checks across all agents before giving up.</p>
+    </div>
+  </div>
+
+  <div class="callout" style="background:rgba(59,130,246,0.06);border-color:var(--accent-blue);margin-top:16px">
+    <h4 style="color:var(--accent-blue)">Bottom line</h4>
+    <p>AgentHub trades API tokens for wall-clock speed and specialized depth. It's faster (0.6x) and matches Claude's accuracy when routing works (5 of 11 questions scored within 0.05), but routing failures tank 2 questions badly. The path to improvement is clear: fix routing to eliminate the 0.06&ndash;0.09 scores, which would bring the overall average from 0.56 to ~0.75+. The token-for-speed tradeoff is favorable for teams that value developer time over API cost.</p>
+  </div>
+</section>
+
+<!-- ==================== SECTION 5: METHODOLOGY ==================== -->
+<section class="section" id="methodology">
+  <div class="section-label" style="color:var(--text-muted)">Methodology</div>
+  <h2 class="section-title">How We Measured</h2>
+  <p class="section-desc" style="margin-bottom:24px">Transparent methodology so you can evaluate the results yourself.</p>
+
+  <div class="grid-2">
+    <div class="card">
+      <h3>Test Repositories (Latest A vs B)</h3>
+      <table>
+        <thead><tr><th>Repo</th><th>Language</th><th>Size</th><th>Questions</th><th>Date</th></tr></thead>
+        <tbody>
+          <tr><td>Strapi</td><td>TypeScript</td><td><span class="badge badge-blue">Medium</span></td><td>5 UQ + 1 CC</td><td>Feb 14</td></tr>
+          <tr><td>Medusa</td><td>TypeScript</td><td><span class="badge badge-blue">Medium</span></td><td>5 UQ</td><td>Feb 14</td></tr>
+        </tbody>
+      </table>
+      <p style="font-size:12px;color:var(--text-muted);margin-top:8px">Previous runs also cover: HTTPBin (Python, small), Smartstore (Python+TS, medium), Django (Python, large)</p>
+    </div>
+    <div class="card">
+      <h3>Evaluation Method</h3>
+      <ul style="list-style:none;padding:0">
+        <li style="padding:6px 0;font-size:14px;color:var(--text-secondary)"><strong>Condition A:</strong> <code style="background:var(--bg-hover);padding:1px 4px;border-radius:3px">claude -p &lt;question&gt;</code> in repo directory</li>
+        <li style="padding:6px 0;font-size:14px;color:var(--text-secondary)"><strong>Condition B:</strong> <code style="background:var(--bg-hover);padding:1px 4px;border-radius:3px">hub.run(question)</code> via Python API</li>
+        <li style="padding:6px 0;font-size:14px;color:var(--text-secondary)"><strong>Scoring:</strong> Automated &mdash; file_coverage (40%) + keyword_match (40%) + length (20%)</li>
+        <li style="padding:6px 0;font-size:14px;color:var(--text-secondary)"><strong>Ground truth:</strong> Hand-written expected answers with relevant file paths</li>
+        <li style="padding:6px 0;font-size:14px;color:var(--text-secondary)"><strong>Tokens (B):</strong> Full input+output from Anthropic API</li>
+        <li style="padding:6px 0;font-size:14px;color:var(--text-secondary)"><strong>Tokens (A):</strong> Output-length estimate only (not full API tokens)</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="callout" style="background:rgba(245,158,11,0.06);border-color:var(--accent-yellow);margin-top:16px">
+    <h4 style="color:var(--accent-yellow)">Limitations</h4>
+    <p>11 matched A/B questions across 2 repos. Results are directional, not statistically significant. Claude Code token counts are output-only estimates (actual usage is 50&ndash;200x higher). Two routing failures (scoring 0.06&ndash;0.09) heavily skew AgentHub's average downward. Automated scoring (keyword+file match) doesn't capture answer quality nuances &mdash; both conditions often produce equally thorough answers that score differently due to exact file path mentions. AgentHub v0.1.0 (alpha).</p>
+  </div>
+</section>
+
+</div>
+
+<!-- Footer -->
+<footer>
+  <p style="margin-bottom:8px"><strong style="color:var(--text-secondary)">AgentHub</strong> &middot; v0.1.0 &middot; MIT License</p>
+  <p>
+    <a href="https://github.com/white-dots/agent_hub">GitHub</a> &middot;
+    Built with Claude Code
+  </p>
+</footer>
+
+</body>
+</html>

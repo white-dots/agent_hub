@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Tier A (Business/Domain) Agent Discovery.
 
 This module automatically discovers and loads Tier A agents from project files.
@@ -313,14 +314,13 @@ def load_tier_a_agents(
 
     This function:
     1. Scans for agent files using TierADiscovery
-    2. If a factory function is found, calls it to get agents
-    3. Otherwise, instantiates discovered agent classes directly
+    2. Instantiates discovered agent classes directly (skips factory functions
+       to avoid recursion when factories call discover_all_agents)
 
     Args:
         project_root: Path to project.
         llm_client: LLM client to use. If None, creates one based on discovered provider.
-        hub: Optional AgentHub instance. If provided and factory returns a hub,
-             agents are extracted from it.
+        hub: Optional AgentHub instance (unused, kept for compatibility).
 
     Returns:
         List of instantiated Tier A agents.
@@ -330,27 +330,16 @@ def load_tier_a_agents(
 
     agents: list["BaseAgent"] = []
 
-    # If we have factory functions, try to use them
-    for factory in result.factories:
+    # Instantiate agent classes directly
+    # Note: We skip factory functions because they often call discover_all_agents()
+    # internally, which causes infinite recursion
+    for agent_info in result.agents:
         try:
-            module_agents = _load_from_factory(
-                factory,
-                project_root,
-                llm_client,
-            )
-            agents.extend(module_agents)
+            agent = _instantiate_agent(agent_info, project_root, llm_client)
+            if agent:
+                agents.append(agent)
         except Exception as e:
-            print(f"Warning: Failed to load from factory {factory.function_name}: {e}")
-
-    # If no factories worked, try instantiating agent classes directly
-    if not agents:
-        for agent_info in result.agents:
-            try:
-                agent = _instantiate_agent(agent_info, project_root, llm_client)
-                if agent:
-                    agents.append(agent)
-            except Exception as e:
-                print(f"Warning: Failed to instantiate {agent_info.class_name}: {e}")
+            print(f"Warning: Failed to instantiate {agent_info.class_name}: {e}")
 
     return agents
 
@@ -381,15 +370,23 @@ def _load_from_factory(
             return []
 
         # Try calling with different signatures
+        # Important: Disable auto-agents/code-agents to prevent duplicate registration
         result = None
 
-        # Try: create_hub(project_root, enable_auto_agents=False)
+        # Try: create_hub(project_root, enable_code_agents=False)
         try:
-            result = func(project_root, enable_auto_agents=False)
+            result = func(project_root, enable_code_agents=False)
         except TypeError:
             pass
 
-        # Try: create_hub(project_root)
+        # Try: create_hub(project_root, enable_auto_agents=False)
+        if result is None:
+            try:
+                result = func(project_root, enable_auto_agents=False)
+            except TypeError:
+                pass
+
+        # Try: create_hub(project_root) - but this may enable auto-agents
         if result is None:
             try:
                 result = func(project_root)

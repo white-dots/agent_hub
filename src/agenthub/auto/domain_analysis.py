@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Domain analysis for dynamic Tier B agent generation.
 
 This module identifies natural domains in a codebase by combining:

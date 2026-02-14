@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Change analysis pipeline orchestrating Tier B agents and QC Agent.
 
 This module provides the ChangeAnalysisPipeline class that:

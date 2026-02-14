@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Data models for QC (Quality Control) analysis.
 
 This module defines the core data structures for:

@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Abstract LLM client interface.
 
 This module provides an abstraction layer for different LLM providers,
