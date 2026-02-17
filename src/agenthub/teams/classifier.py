@@ -276,8 +276,9 @@ class ComplexityClassifier:
         if exclude_sub_agents:
             agents = [a for a in agents if not a.metadata.get("is_sub_agent", False)]
 
-        # Use KeywordRouter's scoring logic
-        router = KeywordRouter(case_sensitive=False)
+        # Use KeywordRouter's scoring logic with KG boost if available
+        kg = getattr(self.hub, "_knowledge_graph", None)
+        router = KeywordRouter(case_sensitive=False, knowledge_graph=kg)
         return router.get_all_scores(query, agents)
 
     def _has_cross_cutting_signal(self, query: str) -> bool:

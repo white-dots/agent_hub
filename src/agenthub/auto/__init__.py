@@ -62,6 +62,13 @@ from agenthub.auto.routing_index import (
     IndexedKeywordRouter,
     AgentRoutingMetadata,
 )
+from agenthub.auto.knowledge_graph import (
+    CodebaseKnowledgeGraph,
+    DomainNode,
+    EntityNode,
+    ConceptNode,
+    KGEdge,
+)
 
 if TYPE_CHECKING:
     from agenthub.hub import AgentHub
@@ -174,6 +181,18 @@ def discover_all_agents(
         hub._project_root = str(Path(project_root).resolve())
 
         summary_parts.append(f"\nTier B agents created: {tier_b_count}")
+
+        # Step 2.5: Build knowledge graph from import graph + domains
+        if factory._import_graph is not None and getattr(factory, "_domains", None):
+            try:
+                kg = CodebaseKnowledgeGraph(factory._import_graph, factory._domains)
+                kg.build()
+                hub._knowledge_graph = kg
+                summary_parts.append("")
+                summary_parts.append("Knowledge Graph:")
+                summary_parts.append(f"  {kg.get_summary()}")
+            except Exception as e:
+                summary_parts.append(f"Knowledge graph build warning: {e}")
 
         # Step 3: Create sub-agents for large Tier B agents
         sub_agent_count = 0
@@ -442,4 +461,10 @@ __all__ = [
     "RoutingIndexBuilder",
     "IndexedKeywordRouter",
     "AgentRoutingMetadata",
+    # Knowledge graph (auto-generated at setup time)
+    "CodebaseKnowledgeGraph",
+    "DomainNode",
+    "EntityNode",
+    "ConceptNode",
+    "KGEdge",
 ]

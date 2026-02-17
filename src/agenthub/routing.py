@@ -48,13 +48,15 @@ class KeywordRouter:
         "test": ["test", "spec", "mock", "jest", "pytest", "unittest", "coverage"],
     }
 
-    def __init__(self, case_sensitive: bool = False):
+    def __init__(self, case_sensitive: bool = False, knowledge_graph=None):
         """Initialize KeywordRouter.
 
         Args:
             case_sensitive: Whether keyword matching is case-sensitive.
+            knowledge_graph: Optional CodebaseKnowledgeGraph for relationship-aware scoring.
         """
         self.case_sensitive = case_sensitive
+        self._knowledge_graph = knowledge_graph
 
     def route(self, query: str, agents: list[AgentSpec]) -> Optional[str]:
         """Route query based on keyword matching.
@@ -161,6 +163,18 @@ class KeywordRouter:
                 score += routing.priority * 0.1
 
             scores[agent.agent_id] = score
+
+        # KG boost: if a knowledge graph is available, boost agents
+        # related to the top-scoring agent via shared entities or imports.
+        if self._knowledge_graph and scores:
+            top_agent = max(scores, key=scores.get)  # type: ignore[arg-type]
+            top_score = scores[top_agent]
+            if top_score > 0:
+                related = self._knowledge_graph.get_related_domains(top_agent)
+                for related_id, _edge_type, weight in related:
+                    if related_id in scores and scores[related_id] == 0:
+                        # Give a small boost so related agents aren't invisible
+                        scores[related_id] += min(weight * 0.5, 2.0)
 
         return scores
 

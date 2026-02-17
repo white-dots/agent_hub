@@ -559,6 +559,9 @@ Reference specific code in your answers.""",
         )
         domains = domain_analysis.analyze()
 
+        # Store domains for knowledge graph building
+        self._domains = domains
+
         # Generate R&R for each domain
         rnr_generator = DynamicRnRGenerator(import_graph, domains)
 

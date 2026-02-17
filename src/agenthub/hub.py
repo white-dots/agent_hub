@@ -422,7 +422,7 @@ class AgentHub:
         if "B" not in tried_tiers:
             tier_b = [a for a in agents if a.metadata.get("auto_generated")]
             if tier_b:
-                b_router = KeywordRouter()
+                b_router = KeywordRouter(knowledge_graph=getattr(self, "_knowledge_graph", None))
                 b_scores = b_router.get_all_scores(query, tier_b)
                 for aid, score in sorted(
                     b_scores.items(), key=lambda x: x[1], reverse=True
@@ -434,7 +434,7 @@ class AgentHub:
         if "A" not in tried_tiers:
             tier_a = [a for a in agents if not a.metadata.get("auto_generated")]
             if tier_a:
-                a_router = KeywordRouter()
+                a_router = KeywordRouter(knowledge_graph=getattr(self, "_knowledge_graph", None))
                 a_scores = a_router.get_all_scores(query, tier_a)
                 for aid, score in sorted(
                     a_scores.items(), key=lambda x: x[1], reverse=True
