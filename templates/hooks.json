@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'EXT=\"${CLAUDE_FILE_PATH##*.}\"; if [ \"$EXT\" = \"py\" ]; then python -m ruff check \"$CLAUDE_FILE_PATH\" 2>&1 | head -20 || python -m mypy \"$CLAUDE_FILE_PATH\" --no-error-summary 2>&1 | head -20; elif [ \"$EXT\" = \"ts\" ] || [ \"$EXT\" = \"tsx\" ]; then npx tsc --noEmit 2>&1 | head -20; fi'",
+            "timeout": 15000
+          }
+        ]
+      }
+    ]
+  }
+}

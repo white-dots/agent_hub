@@ -798,3 +798,284 @@ class ImportGraph:
             path for path, node in self.nodes.items()
             if node.language == language
         ]
+
+    # ------------------------------------------------------------------
+    # Impact analysis methods
+    # ------------------------------------------------------------------
+
+    def is_test_file(self, path: str) -> bool:
+        """Check if a file path is a test file by naming/path convention.
+
+        Detects:
+        - Python: test_*.py, *_test.py, conftest.py, tests/ directory
+        - TS/JS: *.test.ts, *.spec.ts, *.test.tsx, *.spec.tsx,
+                 __tests__/ directory, *.test.js, *.spec.js
+        """
+        p = Path(path)
+        name = p.name.lower()
+        parts_lower = [part.lower() for part in p.parts]
+
+        # Directory-based
+        if "tests" in parts_lower or "test" in parts_lower or "__tests__" in parts_lower:
+            return True
+
+        # Python
+        if name.startswith("test_") and name.endswith(".py"):
+            return True
+        if name.endswith("_test.py"):
+            return True
+        if name == "conftest.py":
+            return True
+
+        # TS/JS
+        for ext in (".test.ts", ".spec.ts", ".test.tsx", ".spec.tsx",
+                     ".test.js", ".spec.js", ".test.jsx", ".spec.jsx"):
+            if name.endswith(ext):
+                return True
+
+        return False
+
+    def get_transitive_importers(self, path: str, max_depth: int = 10) -> list[str]:
+        """Get all files that transitively depend on this file.
+
+        Walks imported_by edges via BFS up to max_depth hops.
+
+        Args:
+            path: Relative path to the module.
+            max_depth: Maximum traversal depth.
+
+        Returns:
+            List of module paths that transitively import this file.
+            Does NOT include the input path itself.
+        """
+        if not self._built:
+            self.build()
+
+        if path not in self.nodes:
+            return []
+
+        visited: set[str] = {path}
+        queue: list[tuple[str, int]] = [(path, 0)]
+        result: list[str] = []
+
+        while queue:
+            current, depth = queue.pop(0)
+            if depth >= max_depth:
+                continue
+
+            node = self.nodes.get(current)
+            if not node:
+                continue
+
+            for importer in node.imported_by:
+                if importer not in visited:
+                    visited.add(importer)
+                    result.append(importer)
+                    queue.append((importer, depth + 1))
+
+        return result
+
+    def get_affected_tests(self, paths: list[str]) -> list[str]:
+        """Get test files that could be affected by changes to the given files.
+
+        For each input path, finds transitive importers and filters to test files.
+
+        Args:
+            paths: List of relative file paths that were changed.
+
+        Returns:
+            Sorted, deduplicated list of affected test file paths.
+        """
+        if not self._built:
+            self.build()
+
+        test_files: set[str] = set()
+
+        for path in paths:
+            # The changed file itself might be a test
+            if path in self.nodes and self.is_test_file(path):
+                test_files.add(path)
+
+            # Check all transitive importers
+            for importer in self.get_transitive_importers(path):
+                if self.is_test_file(importer):
+                    test_files.add(importer)
+
+        return sorted(test_files)
+
+    def get_exported_interface(self, path: str) -> dict:
+        """Get the exported interface of a file.
+
+        Re-parses the file to extract the current exported interface.
+        For Python, respects __all__ if present.
+
+        Args:
+            path: Relative path to the module.
+
+        Returns:
+            Dict with keys: classes, functions, constants, language.
+        """
+        empty = {"classes": [], "functions": [], "constants": [], "language": "unknown"}
+
+        node = self.nodes.get(path) if self._built else None
+        language = node.language if node else self._guess_language(path)
+        empty["language"] = language
+
+        full_path = self.root_path / path
+        if not full_path.exists():
+            return empty
+
+        try:
+            content = full_path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            return empty
+
+        if language == "python":
+            return self._get_python_interface(content)
+        elif language in ("typescript", "javascript"):
+            return self._get_ts_js_interface(content, language)
+        return empty
+
+    def _guess_language(self, path: str) -> str:
+        suffix = Path(path).suffix.lower()
+        for lang, exts in self.EXTENSIONS.items():
+            if suffix in exts:
+                return lang
+        return "unknown"
+
+    def _get_python_interface(self, content: str) -> dict:
+        """Extract exported interface from Python source."""
+        try:
+            tree = ast.parse(content)
+        except SyntaxError:
+            return {"classes": [], "functions": [], "constants": [], "language": "python"}
+
+        # Check for __all__
+        all_names: set[str] | None = None
+        for node in tree.body:
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id == "__all__":
+                        if isinstance(node.value, (ast.List, ast.Tuple)):
+                            all_names = set()
+                            for elt in node.value.elts:
+                                if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                                    all_names.add(elt.value)
+
+        classes = []
+        functions = []
+        constants = []
+
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef):
+                if all_names is not None and node.name not in all_names:
+                    continue
+                if node.name.startswith("_") and all_names is None:
+                    continue
+                methods = []
+                bases = [self._ast_name(b) for b in node.bases if self._ast_name(b)]
+                for item in node.body:
+                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        if not item.name.startswith("_") or item.name in ("__init__", "__call__"):
+                            methods.append(item.name)
+                classes.append({"name": node.name, "methods": methods, "bases": bases})
+
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if all_names is not None and node.name not in all_names:
+                    continue
+                if node.name.startswith("_") and all_names is None:
+                    continue
+                args = [a.arg for a in node.args.args if a.arg != "self"]
+                functions.append({
+                    "name": node.name,
+                    "args": args,
+                    "is_async": isinstance(node, ast.AsyncFunctionDef),
+                })
+
+            elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+                names = []
+                if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                    names = [node.target.id]
+                elif isinstance(node, ast.Assign):
+                    for target in node.targets:
+                        if isinstance(target, ast.Name):
+                            names.append(target.id)
+                for name in names:
+                    if all_names is not None and name not in all_names:
+                        continue
+                    if name.startswith("_") and all_names is None:
+                        continue
+                    if name == "__all__":
+                        continue
+                    # Only include UPPER_CASE constants
+                    if name.isupper() or (all_names is not None and name in all_names):
+                        ann = None
+                        if isinstance(node, ast.AnnAssign) and node.annotation:
+                            ann = ast.dump(node.annotation)
+                        constants.append({"name": name, "type_annotation": ann})
+
+        return {"classes": classes, "functions": functions, "constants": constants, "language": "python"}
+
+    @staticmethod
+    def _ast_name(node) -> str:
+        """Extract name string from AST node."""
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            return node.attr
+        return ""
+
+    # Regex for exported TS/JS interface extraction
+    _TS_EXPORT_FUNC = re.compile(
+        r"export\s+(?:default\s+)?(?:async\s+)?function\s+(\w+)\s*\(([^)]*)\)"
+    )
+    _TS_EXPORT_CONST_FUNC = re.compile(
+        r"export\s+const\s+(\w+)\s*=\s*(?:async\s+)?\([^)]*\)\s*(?::\s*[^=]+)?\s*=>"
+    )
+    _TS_EXPORT_CLASS = re.compile(
+        r"export\s+(?:default\s+)?class\s+(\w+)"
+    )
+    _TS_EXPORT_CONST = re.compile(
+        r"export\s+const\s+(\w+)\s*(?::\s*\w[^=]*)?\s*="
+    )
+    _TS_EXPORT_TYPE = re.compile(
+        r"export\s+(?:type|interface)\s+(\w+)"
+    )
+
+    def _get_ts_js_interface(self, content: str, language: str) -> dict:
+        """Extract exported interface from TypeScript/JavaScript source."""
+        classes = []
+        functions = []
+        constants = []
+
+        # Exported functions
+        func_names: set[str] = set()
+        for match in self._TS_EXPORT_FUNC.finditer(content):
+            name = match.group(1)
+            args_str = match.group(2).strip()
+            args = [a.strip().split(":")[0].strip() for a in args_str.split(",") if a.strip()] if args_str else []
+            functions.append({"name": name, "args": args, "is_async": "async" in match.group(0)})
+            func_names.add(name)
+
+        # Arrow function exports
+        for match in self._TS_EXPORT_CONST_FUNC.finditer(content):
+            name = match.group(1)
+            if name not in func_names:
+                functions.append({"name": name, "args": [], "is_async": "async" in match.group(0)})
+                func_names.add(name)
+
+        # Exported classes
+        for match in self._TS_EXPORT_CLASS.finditer(content):
+            classes.append({"name": match.group(1), "methods": [], "bases": []})
+
+        # Exported constants (exclude those already captured as functions)
+        for match in self._TS_EXPORT_CONST.finditer(content):
+            name = match.group(1)
+            if name not in func_names:
+                constants.append({"name": name, "type_annotation": None})
+
+        # Exported types/interfaces
+        for match in self._TS_EXPORT_TYPE.finditer(content):
+            constants.append({"name": match.group(1), "type_annotation": "type"})
+
+        return {"classes": classes, "functions": functions, "constants": constants, "language": language}

@@ -1,18 +1,17 @@
-from __future__ import annotations
 #!/usr/bin/env python3
-"""AgentHub MCP Server - Expose AgentHub agents as tools for Claude Code.
+"""AgentHub MCP Server — Impact analysis tools for large codebases.
 
-This MCP server creates its own AgentHub instance and exposes agents
-as tools for Claude Code through the Model Context Protocol.
+Exposes dependency graph analysis as MCP tools for Claude Code.
+No LLM calls, no API key needed, zero token cost.
 
 Usage:
-    Configure Claude Code to use this MCP server by adding to ~/.claude.json:
+    Configure in ~/.claude.json:
 
     {
       "mcpServers": {
         "agenthub": {
           "command": "python",
-          "args": ["-m", "agenthub.mcp_server", "--project", "/path/to/your/project"],
+          "args": ["-m", "agenthub.mcp_server", "--project", "/path/to/project"],
           "env": {
             "PYTHONPATH": "/path/to/AgentHub/src"
           }
@@ -20,614 +19,378 @@ Usage:
       }
     }
 
-    IMPORTANT: Always specify --project to ensure the MCP server analyzes
-    the correct project. This should match the project you run 'agenthub up' on.
+Tools:
+    - impact_check: Check blast radius before editing a file
+    - affected_tests: Find tests to run after editing files
+    - codebase_overview: Get project structure overview
 
-    Alternative: Set AGENTHUB_PROJECT environment variable instead of --project.
-
-Available Tools:
-    - agenthub_query: Ask a question routed to the best agent
-    - agenthub_list_agents: See all available agents
-    - agenthub_routing_rules: See how queries are routed
+Resources:
+    - repo://map: Auto-injected repo map with key modules, dependency chains,
+      and editing guidance. Loaded into every agent's context automatically.
 """
+from __future__ import annotations
 
 import json
 import os
+import signal
 import sys
-import urllib.request
-import urllib.error
 from pathlib import Path
 from typing import Any, Optional
 
-from dotenv import load_dotenv
-
-# AgentHub will be initialized lazily
-_hub = None
+_graph = None
+_repo_map_cache: Optional[str] = None
 _project_root: Optional[str] = None
-_env_loaded = False
-
-# Dashboard URL for broadcasting events (optional)
-DASHBOARD_URL = os.environ.get("AGENTHUB_DASHBOARD_URL", "http://localhost:3001")
-
-
-def broadcast_to_dashboard(event_type: str, description: str, details: dict = None):
-    """Send an event to the dashboard for display.
-
-    This is fire-and-forget - errors are silently ignored since
-    the dashboard may not be running.
-
-    Automatically includes the current repo name from _project_root
-    so the dashboard can show which project is being worked on.
-    """
-    try:
-        enriched_details = details.copy() if details else {}
-
-        # Include repo context from the current project root
-        if _project_root and "repo" not in enriched_details:
-            enriched_details["repo"] = Path(_project_root).name
-
-        data = {
-            "event_type": event_type,
-            "description": description,
-            "details": enriched_details,
-        }
-        req = urllib.request.Request(
-            f"{DASHBOARD_URL}/api/claude-code/log",
-            data=json.dumps(data).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        urllib.request.urlopen(req, timeout=1)
-    except Exception:
-        # Dashboard not running or unreachable - that's fine
-        pass
-
-
-def load_project_env(project_path: str) -> None:
-    """Load .env from project directory and home directory.
-
-    Priority (later overrides earlier):
-    1. Home directory ~/.env
-    2. Project directory .env
-    """
-    global _env_loaded
-    if _env_loaded:
-        return
-
-    # Load from home directory first
-    home_env = Path.home() / ".env"
-    if home_env.exists():
-        load_dotenv(home_env)
-        print(f"Loaded .env from: {home_env}", file=sys.stderr)
-
-    # Load from project directory - this overrides home
-    project_env = Path(project_path) / ".env"
-    if project_env.exists():
-        load_dotenv(project_env, override=True)
-        print(f"Loaded .env from: {project_env}", file=sys.stderr)
-
-    _env_loaded = True
 
 
 def _resolve_project_root() -> Optional[str]:
-    """Resolve the project root from all available sources.
-
-    Priority order (highest to lowest):
-        1. --project CLI argument (set in main() before this is called)
-        2. AGENTHUB_PROJECT environment variable
-        3. Saved config from ~/.agenthub/config.json (set by 'agenthub build')
-
-    Returns:
-        Resolved absolute project path, or None if not found.
-    """
-    global _project_root
-
-    # Source 1: CLI argument (already set by main())
+    """Resolve project root from --project flag or env var."""
     if _project_root:
-        print(f"Project root (from --project): {_project_root}", file=sys.stderr)
         return str(Path(_project_root).resolve())
 
-    # Source 2: Environment variable
     env_project = os.environ.get("AGENTHUB_PROJECT")
     if env_project:
-        print(f"Project root (from AGENTHUB_PROJECT env): {env_project}", file=sys.stderr)
         return str(Path(env_project).resolve())
-
-    # Source 3: Saved config (from 'agenthub build')
-    try:
-        from agenthub.setup import get_current_project
-        saved_project = get_current_project()
-        if saved_project:
-            print(f"Project root (from ~/.agenthub/config.json): {saved_project}", file=sys.stderr)
-            return str(Path(saved_project).resolve())
-    except ImportError:
-        pass
 
     return None
 
 
-def get_hub(force_refresh: bool = False):
-    """Get or create the AgentHub instance.
+def get_graph():
+    """Get or build the import graph (lazy, cached)."""
+    global _graph
 
-    Args:
-        force_refresh: If True, recreate the hub even if it exists.
-    """
-    global _hub, _project_root, _env_loaded
+    if _graph is not None:
+        return _graph
 
-    if _hub is not None and not force_refresh:
-        return _hub
-
-    # Clear existing hub if refreshing
-    if force_refresh:
-        print("Refreshing AgentHub...", file=sys.stderr)
-        _hub = None
-        _env_loaded = False  # Allow .env to be reloaded
-
-    # Resolve project root from all sources
-    resolved_root = _resolve_project_root()
-
-    if not resolved_root:
-        print("ERROR: No project path specified.", file=sys.stderr)
-        print("Options:", file=sys.stderr)
-        print("  1. Use --project /path/to/project in MCP config", file=sys.stderr)
-        print("  2. Set AGENTHUB_PROJECT environment variable", file=sys.stderr)
-        print("  3. Run 'agenthub build /path/to/project' first", file=sys.stderr)
+    root = _resolve_project_root()
+    if not root:
+        print("ERROR: No project path. Use --project or AGENTHUB_PROJECT env.", file=sys.stderr)
         return None
 
-    _project_root = resolved_root
-
-    if not Path(_project_root).is_dir():
-        print(f"ERROR: Project path does not exist: {_project_root}", file=sys.stderr)
+    if not Path(root).is_dir():
+        print(f"ERROR: Project path does not exist: {root}", file=sys.stderr)
         return None
-
-    # Load .env from the actual project directory
-    load_project_env(_project_root)
 
     try:
-        from agenthub.auto import discover_all_agents
-        _hub, summary = discover_all_agents(_project_root)
+        from agenthub.auto.import_graph import ImportGraph
 
-        # Enable team execution if import graph is available
-        if _hub._import_graph is not None:
-            try:
-                _hub.enable_teams()
-                print("DAG team execution enabled", file=sys.stderr)
-            except Exception as e:
-                print(f"Warning: Could not enable teams: {e}", file=sys.stderr)
-
-        # Enable parallel sessions if project is a git repo
-        try:
-            import subprocess
-
-            result = subprocess.run(
-                ["git", "rev-parse", "--is-inside-work-tree"],
-                cwd=_project_root,
-                capture_output=True,
-                timeout=5,
-            )
-            if result.returncode == 0:
-                _hub.enable_parallel_sessions(_project_root)
-                print("Parallel sessions enabled", file=sys.stderr)
-        except Exception as e:
-            print(f"Warning: Could not enable parallel sessions: {e}", file=sys.stderr)
-
-        # Log to stderr (won't interfere with MCP protocol on stdout)
-        print(f"AgentHub initialized for: {_project_root}", file=sys.stderr)
-        print(summary, file=sys.stderr)
-        return _hub
+        _graph = ImportGraph(root)
+        _graph.build()
+        stats = _graph.get_stats()
+        print(f"Import graph built: {stats['total_modules']} modules, {stats['total_edges']} edges", file=sys.stderr)
+        return _graph
     except Exception as e:
-        print(f"Error initializing AgentHub: {e}", file=sys.stderr)
+        print(f"Error building import graph: {e}", file=sys.stderr)
         import traceback
         traceback.print_exc(file=sys.stderr)
         return None
 
 
-# Tool definitions for MCP
-TOOLS = [
+def get_repo_map() -> Optional[str]:
+    """Get the repo map (cached after first generation)."""
+    global _repo_map_cache
+
+    if _repo_map_cache is not None:
+        return _repo_map_cache
+
+    graph = get_graph()
+    if graph is None:
+        return None
+
+    try:
+        from agenthub.repo_map import generate_repo_map
+        _repo_map_cache = generate_repo_map(graph)
+        return _repo_map_cache
+    except Exception as e:
+        print(f"Error generating repo map: {e}", file=sys.stderr)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# MCP Resources
+# ---------------------------------------------------------------------------
+
+RESOURCES = [
     {
-        "name": "agenthub_query",
-        "description": """Ask a question about the codebase using AgentHub's specialized agents.
-
-The query will be automatically routed to the best agent based on keywords:
-- API/endpoint questions -> API Expert
-- Database/model questions -> Model Expert
-- Business logic questions -> Service Expert
-- Configuration questions -> Config Expert
-- Test questions -> Test Expert
-
-For complex cross-cutting queries (e.g., "How does data flow from API to database?"),
-AgentHub can use team execution with multiple agents working together.
-
-Use this for codebase-specific questions that benefit from specialized knowledge.""",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "question": {
-                    "type": "string",
-                    "description": "The question to ask about the codebase"
-                },
-                "agent_id": {
-                    "type": "string",
-                    "description": "Optional: specific agent ID to use (bypasses auto-routing)"
-                },
-                "team_mode": {
-                    "type": "string",
-                    "enum": ["auto", "always", "never"],
-                    "description": "Team execution mode: 'auto' (let AgentHub decide), 'always' (force team), 'never' (force single agent). Default: 'auto'. Prefer 'auto' for most queries - only use 'always' for explicitly cross-cutting questions that span multiple domains."
-                }
-            },
-            "required": ["question"]
-        }
+        "uri": "repo://map",
+        "name": "Repo Map",
+        "description": (
+            "Auto-generated map of the codebase showing key modules, dependency chains, "
+            "directory layout, and editing guidance. Use this to understand the project "
+            "structure before making changes."
+        ),
+        "mimeType": "text/markdown",
     },
-    {
-        "name": "agenthub_list_agents",
-        "description": "List all available AgentHub agents with their specializations and keywords.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {},
-            "required": []
-        }
-    },
-    {
-        "name": "agenthub_refresh",
-        "description": """Refresh the AgentHub to reload all agents.
-
-Use this when:
-- You've modified agent configurations
-- You've added new Tier A agents
-- The agent list seems stale or outdated
-- After running 'agenthub clean' or 'agenthub up'
-
-This will re-discover all Tier A agents and regenerate Tier B agents.""",
-        "inputSchema": {
-            "type": "object",
-            "properties": {},
-            "required": []
-        }
-    },
-    {
-        "name": "agenthub_routing_rules",
-        "description": "Show the routing rules that determine which agent handles which queries.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {},
-            "required": []
-        }
-    },
-    {
-        "name": "agenthub_parallel_preview",
-        "description": """Preview how a multi-part request would be decomposed into parallel tasks.
-
-Use this to understand what parallel execution would do before actually running it.
-Shows task breakdown, risk analysis, and execution plan.""",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "request": {
-                    "type": "string",
-                    "description": "The multi-part request to analyze (e.g., 'Add save button and chart component')"
-                }
-            },
-            "required": ["request"]
-        }
-    },
-    {
-        "name": "agenthub_parallel_execute",
-        "description": """Execute a multi-part request using parallel Claude Code sessions.
-
-This decomposes the request into tasks and runs them in parallel on separate git branches,
-then merges the results. Use for requests that involve multiple independent changes.
-
-Prerequisites:
-- Project must be a git repository
-- Working tree must be clean (no uncommitted changes)
-- Auto-agents must be enabled""",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "request": {
-                    "type": "string",
-                    "description": "The multi-part request to execute in parallel"
-                },
-                "base_branch": {
-                    "type": "string",
-                    "description": "Git branch to work from (default: 'main')"
-                }
-            },
-            "required": ["request"]
-        }
-    }
 ]
 
 
-def handle_tool_call(name: str, arguments: dict) -> Any:
-    """Handle a tool call and return the result."""
+def _normalize_path(file_path: str) -> str:
+    """Normalize a file path to be relative to project root."""
+    root = _resolve_project_root()
+    if not root:
+        return file_path
 
-    hub = get_hub()
-    if hub is None:
-        return """Error: AgentHub not initialized.
-
-Please ensure:
-1. You specified --project /path/to/project in your MCP config
-2. Or set AGENTHUB_PROJECT environment variable
-3. ANTHROPIC_API_KEY is set (in .env or environment)
-
-Example MCP config:
-{
-  "mcpServers": {
-    "agenthub": {
-      "command": "python",
-      "args": ["-m", "agenthub.mcp_server", "--project", "/path/to/your/project"],
-      "env": {
-        "PYTHONPATH": "/path/to/AgentHub/src"
-      }
-    }
-  }
-}"""
-
-    if name == "agenthub_query":
-        question = arguments.get("question", "")
-        agent_id = arguments.get("agent_id")
-        team_mode = arguments.get("team_mode", "auto")
-
-        # Broadcast query to dashboard
-        broadcast_to_dashboard(
-            "task",
-            f"Claude Code query: {question[:100]}{'...' if len(question) > 100 else ''}",
-            {"query": question, "requested_agent": agent_id, "team_mode": team_mode},
-        )
-
+    p = Path(file_path)
+    # If absolute, make relative
+    if p.is_absolute():
         try:
-            response = hub.run(question, agent_id=agent_id, team_mode=team_mode)
+            return str(p.relative_to(root))
+        except ValueError:
+            return file_path
 
-            # Build response info
-            team_info = ""
-            if response.metadata.get("team_execution"):
-                agents_used = response.metadata.get("agents_used", [])
-                team_info = f"\nTeam execution: {len(agents_used)} agents used ({', '.join(agents_used)})"
+    # Strip leading ./
+    return str(p).lstrip("./")
 
-            # Broadcast result to dashboard (full content)
-            broadcast_to_dashboard(
-                "result",
-                f"Agent {response.agent_id} responded ({response.tokens_used} tokens)",
-                {
-                    "agent_id": response.agent_id,
-                    "tokens_used": response.tokens_used,
-                    "query": question,
-                    "response": response.content,
-                    "team_execution": response.metadata.get("team_execution", False),
+
+# ---------------------------------------------------------------------------
+# Tool definitions
+# ---------------------------------------------------------------------------
+
+TOOLS = [
+    {
+        "name": "impact_check",
+        "description": (
+            "Check the blast radius of editing a file. Returns what the file exports, "
+            "what depends on it (directly and transitively), affected tests, and risk level. "
+            "Call this BEFORE editing a file to understand what could break."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "Relative path to the file from project root (e.g. 'src/utils.py')",
                 },
-            )
+            },
+            "required": ["file_path"],
+        },
+    },
+    {
+        "name": "affected_tests",
+        "description": (
+            "Find test files affected by changes to the given files. Returns test file paths "
+            "and a suggested test command. Call this AFTER editing files to know what to run."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "file_paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "List of relative file paths that were changed",
+                },
+            },
+            "required": ["file_paths"],
+        },
+    },
+    {
+        "name": "codebase_overview",
+        "description": (
+            "Get a quick overview of the codebase: module count, language breakdown, "
+            "central hub modules, and dependency stats. Use for orientation."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+]
 
-            return f"""Agent: {response.agent_id}
-Tokens used: {response.tokens_used}{team_info}
 
-Response:
-{response.content}"""
-        except Exception as e:
-            broadcast_to_dashboard("error", f"Query failed: {str(e)}")
-            return f"Error querying agent: {e}"
+# ---------------------------------------------------------------------------
+# Tool handlers
+# ---------------------------------------------------------------------------
 
-    elif name == "agenthub_list_agents":
-        agents = hub.list_agents()
-        if not agents:
-            return "No agents available."
+def handle_impact_check(arguments: dict) -> str:
+    graph = get_graph()
+    if graph is None:
+        return "Error: Import graph not available. Check --project path."
 
-        lines = ["Available AgentHub Agents:", ""]
+    raw_path = arguments.get("file_path", "")
+    path = _normalize_path(raw_path)
 
-        # Count by tier
-        tier_a = [s for s in agents if s.metadata.get("tier") == "A" or not s.metadata.get("auto_generated")]
-        tier_b = [s for s in agents if s.metadata.get("tier") == "B" and s.metadata.get("auto_generated") and not s.metadata.get("is_sub_agent")]
-        sub_agents = [s for s in agents if s.metadata.get("is_sub_agent")]
+    if path not in graph.nodes:
+        # Try common variations
+        candidates = [p for p in graph.nodes if p.endswith(path) or path.endswith(p)]
+        if len(candidates) == 1:
+            path = candidates[0]
+        elif candidates:
+            return f"Ambiguous path '{raw_path}'. Did you mean one of:\n" + "\n".join(f"  - {c}" for c in candidates[:10])
+        else:
+            return f"File '{raw_path}' not found in import graph. Use codebase_overview to see indexed modules."
 
-        lines.append(f"Total: {len(agents)} agents ({len(tier_a)} Tier A, {len(tier_b)} Tier B, {len(sub_agents)} Sub-agents)")
+    # Gather data
+    interface = graph.get_exported_interface(path)
+    neighbors = graph.get_module_neighbors(path)
+    transitive = graph.get_transitive_importers(path)
+    tests = graph.get_affected_tests([path])
+    role = graph.get_module_role(path)
+
+    # Risk assessment
+    n_transitive = len(transitive)
+    if n_transitive > 10 or role == "hub":
+        risk = "HIGH"
+        risk_note = f"This is a {role} module with {n_transitive} transitive dependents. Changes here ripple widely."
+    elif n_transitive > 3:
+        risk = "MEDIUM"
+        risk_note = f"{n_transitive} files transitively depend on this."
+    else:
+        risk = "LOW"
+        risk_note = f"Only {n_transitive} transitive dependent(s)."
+
+    # Format output
+    lines = [
+        f"Impact Analysis: {path}",
+        f"Role: {role} | Risk: {risk}",
+        f"{risk_note}",
+        "",
+    ]
+
+    # Exported interface
+    lines.append("EXPORTED INTERFACE:")
+    if interface["classes"]:
+        for cls in interface["classes"]:
+            bases = f"({', '.join(cls['bases'])})" if cls.get("bases") else ""
+            lines.append(f"  class {cls['name']}{bases}")
+            for method in cls.get("methods", []):
+                lines.append(f"    .{method}()")
+    if interface["functions"]:
+        for func in interface["functions"]:
+            args = ", ".join(func.get("args", []))
+            async_prefix = "async " if func.get("is_async") else ""
+            lines.append(f"  {async_prefix}def {func['name']}({args})")
+    if interface["constants"]:
+        for const in interface["constants"]:
+            lines.append(f"  {const['name']}")
+    if not interface["classes"] and not interface["functions"] and not interface["constants"]:
+        lines.append("  (no public exports detected)")
+    lines.append("")
+
+    # Direct dependents
+    direct = neighbors.get("imported_by", [])
+    lines.append(f"DIRECT DEPENDENTS ({len(direct)}):")
+    for dep in direct[:20]:
+        lines.append(f"  {dep}")
+    if len(direct) > 20:
+        lines.append(f"  ... and {len(direct) - 20} more")
+    lines.append("")
+
+    # Transitive dependents (exclude direct to avoid duplication)
+    indirect = [t for t in transitive if t not in direct]
+    if indirect:
+        lines.append(f"TRANSITIVE DEPENDENTS ({len(indirect)} additional):")
+        for dep in indirect[:15]:
+            lines.append(f"  {dep}")
+        if len(indirect) > 15:
+            lines.append(f"  ... and {len(indirect) - 15} more")
         lines.append("")
 
-        for spec in agents:
-            tier = spec.metadata.get("tier", "A" if not spec.metadata.get("auto_generated") else "B")
-            is_sub = spec.metadata.get("is_sub_agent", False)
-            tier_label = f"Tier {tier}" + (" Sub" if is_sub else "")
-            lines.append(f"* {spec.name} [{spec.agent_id}] ({tier_label})")
-            lines.append(f"  {spec.description}")
-            keywords = spec.context_keywords[:5]
-            if keywords:
-                lines.append(f"  Keywords: {', '.join(keywords)}")
-            lines.append("")
-
-        return "\n".join(lines)
-
-    elif name == "agenthub_refresh":
-        # Force refresh the hub
-        refreshed_hub = get_hub(force_refresh=True)
-        if refreshed_hub is None:
-            return "Error: Failed to refresh AgentHub."
-
-        agents = refreshed_hub.list_agents()
-        tier_a = [s for s in agents if s.metadata.get("tier") == "A" or not s.metadata.get("auto_generated")]
-        tier_b = [s for s in agents if s.metadata.get("tier") == "B" and s.metadata.get("auto_generated") and not s.metadata.get("is_sub_agent")]
-        sub_agents = [s for s in agents if s.metadata.get("is_sub_agent")]
-
-        return f"""AgentHub refreshed successfully!
-
-Discovered agents:
-- Tier A (Business): {len(tier_a)} agents
-- Tier B (Code): {len(tier_b)} agents
-- Sub-agents: {len(sub_agents)} agents
-- Total: {len(agents)} agents
-
-Use 'agenthub_list_agents' to see the full list."""
-
-    elif name == "agenthub_routing_rules":
-        agents = hub.list_agents()
-
-        lines = [
-            "AgentHub Routing Rules",
-            "=" * 40,
-            "",
-            "Queries are matched against agent keywords.",
-            "Tier A agents are checked first, then Tier B.",
-            "First match wins.",
-            ""
-        ]
-
-        # Sort by tier
-        tier_a = [s for s in agents if not s.metadata.get("auto_generated")]
-        tier_b = [s for s in agents if s.metadata.get("auto_generated")]
-
-        for spec in tier_a + tier_b:
-            tier = "A" if not spec.metadata.get("auto_generated") else "B"
-            lines.append(f"-> {spec.name} (Tier {tier})")
-            lines.append(f"   {spec.description}")
-            keywords = spec.context_keywords[:10]
-            if keywords:
-                lines.append(f"   Triggers: {', '.join(keywords)}")
-            lines.append("")
-
-        return "\n".join(lines)
-
-    elif name == "agenthub_parallel_preview":
-        request = arguments.get("request", "")
-
-        try:
-            # Ensure parallel sessions is enabled
-            if not hub.is_parallel_enabled:
-                if _project_root:
-                    hub.enable_parallel_sessions(_project_root)
-                else:
-                    return "Error: Cannot enable parallel sessions - no project root specified."
-
-            decomp, plan = hub.preview_parallel(request)
-
-            lines = [
-                "Parallel Execution Preview",
-                "=" * 40,
-                "",
-                f"Request: {request}",
-                "",
-                f"Tasks ({len(decomp.tasks)}):",
-            ]
-
-            for task in decomp.tasks:
-                lines.append(f"  - [{task.task_id}] {task.description}")
-                lines.append(f"    Complexity: {task.complexity}")
-                if task.estimated_files:
-                    lines.append(f"    Files: {', '.join(task.estimated_files[:3])}")
-                if task.depends_on:
-                    lines.append(f"    Depends on: {', '.join(task.depends_on)}")
-
-            lines.extend([
-                "",
-                "Risk Analysis:",
-                f"  Overall Risk: {plan.overall_risk.value.upper()}",
-                f"  PM Recommendation: {plan.pm_recommendation}",
-                f"  Confidence: {plan.confidence:.0%}",
-            ])
-
-            if plan.file_overlaps:
-                lines.append(f"  File Overlaps: {len(plan.file_overlaps)}")
-
-            lines.extend([
-                "",
-                f"Parallel Groups: {len(plan.parallel_groups)}",
-                f"Estimated Speedup: {plan.estimated_speedup:.1f}x",
-            ])
-
-            if plan.reasoning:
-                lines.extend(["", "Reasoning:", plan.reasoning])
-
-            return "\n".join(lines)
-
-        except Exception as e:
-            return f"Error previewing parallel execution: {e}"
-
-    elif name == "agenthub_parallel_execute":
-        request = arguments.get("request", "")
-        base_branch = arguments.get("base_branch", "main")
-
-        # Broadcast to dashboard
-        broadcast_to_dashboard(
-            "parallel_execute",
-            f"Parallel execution: {request[:100]}{'...' if len(request) > 100 else ''}",
-            {"request": request, "base_branch": base_branch},
-        )
-
-        try:
-            # Ensure parallel sessions is enabled
-            if not hub.is_parallel_enabled:
-                if _project_root:
-                    hub.enable_parallel_sessions(_project_root)
-                else:
-                    return "Error: Cannot enable parallel sessions - no project root specified."
-
-            result = hub.execute_parallel(request, base_branch)
-
-            lines = [
-                "Parallel Execution Result",
-                "=" * 40,
-                "",
-                f"Success: {result.success}",
-                f"Tasks: {len(result.tasks)}",
-                f"Time: {result.total_time_seconds:.1f}s",
-                f"Speedup: {result.speedup:.1f}x",
-                f"Total Tokens: {result.total_tokens:,}",
-                "",
-            ]
-
-            # Include error details if execution failed
-            if not result.success and result.error_message:
-                lines.extend([
-                    "ERROR DETAILS:",
-                    result.error_message,
-                    "",
-                ])
-                if result.trace and result.trace.error_traceback:
-                    lines.extend([
-                        "Traceback:",
-                        result.trace.error_traceback,
-                        "",
-                    ])
-
-            if result.session_results:
-                lines.append("Session Results:")
-                for sr in result.session_results:
-                    status = "Success" if sr.success else "Failed"
-                    lines.append(f"  - {sr.task_id}: {status} ({sr.tokens_used} tokens)")
-                    if sr.files_changed:
-                        lines.append(f"    Changed: {', '.join(sr.files_changed[:3])}")
-                    if sr.boundary_crossings:
-                        lines.append(f"    Boundary crossings: {len(sr.boundary_crossings)}")
-                lines.append("")
-
-            if result.merge_result:
-                lines.append("Merge Result:")
-                lines.append(f"  Success: {result.merge_result.success}")
-                lines.append(f"  Branch: {result.merge_result.merged_branch}")
-                if result.merge_result.conflicts:
-                    lines.append(f"  Conflicts: {len(result.merge_result.conflicts)}")
-                if result.merge_result.needs_user_input:
-                    lines.append(f"  Needs user input: {result.merge_result.escalation_reason}")
-
-            # Broadcast result to dashboard
-            broadcast_to_dashboard(
-                "parallel_result",
-                f"Parallel execution {'succeeded' if result.success else 'failed'}: {result.speedup:.1f}x speedup",
-                {
-                    "success": result.success,
-                    "tasks": len(result.tasks),
-                    "speedup": result.speedup,
-                    "tokens": result.total_tokens,
-                },
-            )
-
-            return "\n".join(lines)
-
-        except Exception as e:
-            broadcast_to_dashboard("error", f"Parallel execution failed: {str(e)}")
-            return f"Error executing parallel sessions: {e}"
-
+    # Affected tests
+    lines.append(f"AFFECTED TESTS ({len(tests)}):")
+    if tests:
+        for t in tests:
+            lines.append(f"  {t}")
     else:
-        return f"Unknown tool: {name}"
+        lines.append("  (no test files found in dependency chain)")
 
+    return "\n".join(lines)
+
+
+def handle_affected_tests(arguments: dict) -> str:
+    graph = get_graph()
+    if graph is None:
+        return "Error: Import graph not available. Check --project path."
+
+    raw_paths = arguments.get("file_paths", [])
+    paths = [_normalize_path(p) for p in raw_paths]
+
+    tests = graph.get_affected_tests(paths)
+
+    if not tests:
+        return f"No test files found in the dependency chain of: {', '.join(paths)}"
+
+    # Detect language for command suggestion
+    py_tests = [t for t in tests if t.endswith(".py")]
+    ts_js_tests = [t for t in tests if any(t.endswith(ext) for ext in (".ts", ".tsx", ".js", ".jsx"))]
+
+    lines = [f"Affected tests ({len(tests)}):", ""]
+    for t in tests:
+        lines.append(f"  {t}")
+
+    lines.append("")
+    lines.append("SUGGESTED COMMANDS:")
+    if py_tests:
+        lines.append(f"  pytest {' '.join(py_tests)} -x")
+    if ts_js_tests:
+        # Convert file paths to patterns for jest
+        patterns = [Path(t).stem.replace(".test", "").replace(".spec", "") for t in ts_js_tests]
+        lines.append(f"  npx jest {' '.join(patterns)}")
+
+    return "\n".join(lines)
+
+
+def handle_codebase_overview(arguments: dict) -> str:
+    graph = get_graph()
+    if graph is None:
+        return "Error: Import graph not available. Check --project path."
+
+    stats = graph.get_stats()
+    hubs = graph.get_central_modules(top_n=10)
+
+    lines = [
+        "Codebase Overview",
+        "=" * 40,
+        "",
+        f"Modules: {stats['total_modules']}",
+        f"Dependencies: {stats['total_edges']}",
+        f"Clusters: {stats['num_clusters']}",
+        f"Size: {stats['total_size_kb']:.0f} KB",
+        "",
+        "Languages:",
+    ]
+
+    if stats.get("python_modules"):
+        lines.append(f"  Python: {stats['python_modules']} modules")
+    if stats.get("typescript_modules"):
+        lines.append(f"  TypeScript: {stats['typescript_modules']} modules")
+    if stats.get("javascript_modules"):
+        lines.append(f"  JavaScript: {stats['javascript_modules']} modules")
+
+    lines.extend(["", "Structure:"])
+    lines.append(f"  Hub modules (high fan-in): {stats.get('hub_modules', 0)}")
+    lines.append(f"  Leaf modules (no dependents): {stats.get('leaf_modules', 0)}")
+    lines.append(f"  Isolated modules: {stats.get('isolated_modules', 0)}")
+
+    if hubs:
+        lines.extend(["", "CENTRAL MODULES (most depended on):"])
+        for hub_path in hubs:
+            node = graph.nodes.get(hub_path)
+            n_importers = len(node.imported_by) if node else 0
+            role = graph.get_module_role(hub_path)
+            lines.append(f"  {hub_path} ({role}, {n_importers} importers)")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Tool dispatch
+# ---------------------------------------------------------------------------
+
+def handle_tool_call(name: str, arguments: dict) -> str:
+    handlers = {
+        "impact_check": handle_impact_check,
+        "affected_tests": handle_affected_tests,
+        "codebase_overview": handle_codebase_overview,
+    }
+    handler = handlers.get(name)
+    if handler:
+        return handler(arguments)
+    return f"Unknown tool: {name}"
+
+
+# ---------------------------------------------------------------------------
+# JSON-RPC server
+# ---------------------------------------------------------------------------
 
 def send_response(response: dict):
     """Send a JSON-RPC response to stdout."""
@@ -635,42 +398,32 @@ def send_response(response: dict):
 
 
 def main():
-    """Main MCP server loop - reads JSON-RPC from stdin, writes to stdout."""
+    """MCP server loop — JSON-RPC over stdin/stdout."""
     global _project_root
 
-    # Log all args for debugging
-    print(f"AgentHub MCP Server starting...", file=sys.stderr)
-    print(f"  sys.argv: {sys.argv}", file=sys.stderr)
-    print(f"  AGENTHUB_PROJECT env: {os.environ.get('AGENTHUB_PROJECT', '(not set)')}", file=sys.stderr)
+    print("AgentHub Impact Server starting...", file=sys.stderr)
 
-    # Parse command line args for project path
+    # Parse --project arg
     args = sys.argv[1:]
     for i, arg in enumerate(args):
         if arg == "--project" and i + 1 < len(args):
             _project_root = args[i + 1]
             break
 
-    # Log resolved project source
     if _project_root:
-        print(f"  Project (from --project arg): {_project_root}", file=sys.stderr)
+        print(f"  Project: {_project_root}", file=sys.stderr)
+    elif os.environ.get("AGENTHUB_PROJECT"):
+        print(f"  Project (env): {os.environ['AGENTHUB_PROJECT']}", file=sys.stderr)
     else:
-        env_project = os.environ.get("AGENTHUB_PROJECT")
-        if env_project:
-            print(f"  Project will use AGENTHUB_PROJECT env: {env_project}", file=sys.stderr)
-        else:
-            print("  WARNING: No --project arg or AGENTHUB_PROJECT env. Will fall back to ~/.agenthub/config.json", file=sys.stderr)
-
-    # Handle graceful shutdown so processes don't linger
-    import signal
+        print("  WARNING: No --project arg or AGENTHUB_PROJECT env.", file=sys.stderr)
 
     def _shutdown(signum, frame):
-        print(f"AgentHub MCP Server shutting down (signal {signum}).", file=sys.stderr)
+        print(f"Shutting down (signal {signum}).", file=sys.stderr)
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
 
-    # Read requests from stdin — exit cleanly when stdin closes (parent died)
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -679,18 +432,13 @@ def main():
         try:
             request = json.loads(line)
         except json.JSONDecodeError:
-            send_response({
-                "jsonrpc": "2.0",
-                "id": None,
-                "error": {"code": -32700, "message": "Parse error"}
-            })
+            send_response({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}})
             continue
 
         request_id = request.get("id")
         method = request.get("method", "")
         params = request.get("params", {})
 
-        # Handle MCP protocol methods
         if method == "initialize":
             send_response({
                 "jsonrpc": "2.0",
@@ -698,62 +446,65 @@ def main():
                 "result": {
                     "protocolVersion": "2024-11-05",
                     "capabilities": {
-                        "tools": {}
+                        "tools": {},
+                        "resources": {},
                     },
-                    "serverInfo": {
-                        "name": "agenthub",
-                        "version": "1.0.0"
-                    }
-                }
+                    "serverInfo": {"name": "agenthub-impact", "version": "2.0.0"},
+                },
             })
 
         elif method == "notifications/initialized":
-            # Client acknowledged initialization, no response needed
             pass
 
         elif method == "tools/list":
-            send_response({
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "result": {
-                    "tools": TOOLS
-                }
-            })
+            send_response({"jsonrpc": "2.0", "id": request_id, "result": {"tools": TOOLS}})
 
         elif method == "tools/call":
             tool_name = params.get("name", "")
             tool_args = params.get("arguments", {})
-
             result = handle_tool_call(tool_name, tool_args)
-
             send_response({
                 "jsonrpc": "2.0",
                 "id": request_id,
-                "result": {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": str(result)
-                        }
-                    ]
-                }
+                "result": {"content": [{"type": "text", "text": str(result)}]},
             })
+
+        elif method == "resources/list":
+            send_response({"jsonrpc": "2.0", "id": request_id, "result": {"resources": RESOURCES}})
+
+        elif method == "resources/read":
+            uri = params.get("uri", "")
+            if uri == "repo://map":
+                repo_map = get_repo_map()
+                if repo_map:
+                    send_response({
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "result": {
+                            "contents": [{"uri": uri, "mimeType": "text/markdown", "text": repo_map}],
+                        },
+                    })
+                else:
+                    send_response({
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "error": {"code": -32603, "message": "Failed to generate repo map"},
+                    })
+            else:
+                send_response({
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {"code": -32602, "message": f"Unknown resource: {uri}"},
+                })
 
         elif method == "ping":
-            send_response({
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "result": {}
-            })
+            send_response({"jsonrpc": "2.0", "id": request_id, "result": {}})
 
         else:
             send_response({
                 "jsonrpc": "2.0",
                 "id": request_id,
-                "error": {
-                    "code": -32601,
-                    "message": f"Method not found: {method}"
-                }
+                "error": {"code": -32601, "message": f"Method not found: {method}"},
             })
 
 

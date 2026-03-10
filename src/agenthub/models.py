@@ -13,6 +13,8 @@ class AgentCapability(str, Enum):
 
     CODE_READ = "code_read"
     CODE_WRITE = "code_write"
+    CODE_WRITE_PROPOSED = "code_write_proposed"  # Can propose (not apply) file changes
+    COMMAND_EXEC = "command_exec"  # Can execute shell commands (safety-gated)
     DB_QUERY = "db_query"
     DB_WRITE = "db_write"
     API_CALL = "api_call"
@@ -243,6 +245,12 @@ class AgentResponse(BaseModel):
     artifacts: list[Artifact] = Field(default_factory=list)
     needs_followup: bool = False
     suggested_agent: Optional[str] = None  # For agent handoff
+    confidence: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=1.0,
+        description="Agent's confidence in its response (for multi-agent routing)",
+    )
     metadata: dict[str, Any] = Field(
         default_factory=dict,
         description="Additional metadata (e.g., team_execution trace)",

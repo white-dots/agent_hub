@@ -449,6 +449,295 @@ class AgentHub:
 
         return None
 
+    # ==================== Multi-Agent Routing & Followup ====================
+
+    def _route_multi(self, query: str, max_agents: int = 3) -> list[str]:
+        """Get multiple relevant agents when a query spans domains.
+
+        Returns agent IDs sorted by relevance. Only returns multiple agents
+        if scores indicate genuine multi-domain query (within 60% of top).
+        """
+        agents = self.list_agents()
+        scores: dict[str, float] = {}
+
+        if self._routing_index is not None:
+            try:
+                from agenthub.auto.routing_index import IndexedKeywordRouter
+
+                indexed_router = IndexedKeywordRouter(self._routing_index)
+                scores = indexed_router.get_all_scores(query)
+            except Exception:
+                pass
+
+        if not scores:
+            if isinstance(self._router, KeywordRouter):
+                scores = self._router.get_all_scores(query, agents)
+            elif isinstance(self._router, TierAwareRouter):
+                scores = self._router._keyword_router.get_all_scores(query, agents)
+
+        if not scores:
+            return []
+
+        ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        if not ranked or ranked[0][1] <= 0:
+            return []
+
+        top_score = ranked[0][1]
+        threshold = top_score * 0.6
+        candidates = [
+            aid for aid, score in ranked
+            if score >= threshold and score > 0 and aid in self._agents
+        ]
+
+        return candidates[:max_agents]
+
+    def _handle_followups(
+        self,
+        initial_response: AgentResponse,
+        query: str,
+        session: Session,
+        model: Optional[str],
+        max_followups: int = 3,
+    ) -> AgentResponse:
+        """Handle follow-up routing when an agent signals needs_followup.
+
+        Implements automatic handoff when an agent says "out of scope, ask X"
+        and response merging when multiple agents contribute.
+
+        Args:
+            initial_response: The first agent's response.
+            query: Original user query.
+            session: Current session.
+            model: Model override.
+            max_followups: Max handoff depth.
+
+        Returns:
+            Final merged response.
+        """
+        if not initial_response.needs_followup:
+            return initial_response
+        if not initial_response.suggested_agent and not initial_response.metadata.get("suggested_agent"):
+            return initial_response
+
+        responses = [initial_response]
+        current = initial_response
+        followed_agents: set[str] = {initial_response.agent_id}
+
+        for _ in range(max_followups):
+            if not current.needs_followup:
+                break
+
+            # Get suggested agent from response field or metadata
+            next_name = current.suggested_agent or current.metadata.get("suggested_agent")
+            if not next_name:
+                break
+
+            # Resolve to agent ID (fuzzy match)
+            resolved = self._resolve_agent_name(next_name, followed_agents)
+            if not resolved:
+                break
+
+            followed_agents.add(resolved)
+            agent = self._agents.get(resolved)
+            if not agent:
+                break
+
+            # Build refined query with context from previous response
+            prev_summary = current.content[:2000]
+            refined_query = (
+                f"Context from {current.agent_id}: {prev_summary}\n\n"
+                f"Original question: {query}"
+            )
+
+            # Get cross-agent context if enabled
+            injected_context = ""
+            if self._cross_context_enabled and self._cross_context_manager:
+                from agenthub.auto.cross_context import format_injected_context
+
+                related = self._cross_context_manager.get_related_context(
+                    agent_id=resolved, query=query,
+                )
+                if related:
+                    injected_context = format_injected_context(related)
+
+            session.agent_id = resolved
+            next_response = agent.run(
+                refined_query, session, model=model, injected_context=injected_context,
+            )
+            responses.append(next_response)
+            current = next_response
+
+        if len(responses) == 1:
+            return responses[0]
+
+        # Merge responses
+        return self._merge_responses(responses, query, session)
+
+    def _resolve_agent_name(
+        self, name_or_id: str, exclude: set[str] | None = None,
+    ) -> Optional[str]:
+        """Resolve a fuzzy agent name/ID to an exact agent ID."""
+        exclude = exclude or set()
+
+        # Direct match
+        if name_or_id in self._agents and name_or_id not in exclude:
+            return name_or_id
+
+        # Fuzzy match
+        name_lower = name_or_id.lower().replace(" ", "_")
+        for aid, agent in self._agents.items():
+            if aid in exclude:
+                continue
+            if (name_lower in aid.lower() or
+                    name_lower in agent.spec.name.lower().replace(" ", "_")):
+                return aid
+
+        return None
+
+    def _run_multi_agent(
+        self,
+        query: str,
+        agent_ids: list[str],
+        session: Session,
+        model: Optional[str],
+    ) -> AgentResponse:
+        """Run multiple agents in parallel and merge results.
+
+        Args:
+            query: User query.
+            agent_ids: List of agent IDs to run.
+            session: Current session.
+            model: Model override.
+
+        Returns:
+            Merged AgentResponse.
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        responses: list[AgentResponse] = []
+
+        def _run_single(aid: str) -> AgentResponse:
+            agent = self._agents[aid]
+            # Get cross-agent context if enabled
+            injected_context = ""
+            if self._cross_context_enabled and self._cross_context_manager:
+                from agenthub.auto.cross_context import format_injected_context
+
+                related = self._cross_context_manager.get_related_context(
+                    agent_id=aid, query=query,
+                )
+                if related:
+                    injected_context = format_injected_context(related)
+
+            # Each agent gets a fresh session clone to avoid thread contention
+            agent_session = Session(
+                session_id=f"{session.session_id}_multi_{aid}",
+                agent_id=aid,
+                messages=list(session.messages),
+            )
+            return agent.run(query, agent_session, model=model, injected_context=injected_context)
+
+        with ThreadPoolExecutor(max_workers=len(agent_ids)) as pool:
+            futures = {pool.submit(_run_single, aid): aid for aid in agent_ids}
+            for future in as_completed(futures):
+                try:
+                    resp = future.result()
+                    # Skip scope rejections — only keep substantive responses
+                    if not resp.metadata.get("scope_rejected"):
+                        responses.append(resp)
+                except Exception:
+                    pass
+
+        if not responses:
+            # All agents rejected — fall back to first agent's response
+            agent = self._agents[agent_ids[0]]
+            return agent.run(query, session, model=model)
+
+        if len(responses) == 1:
+            return responses[0]
+
+        return self._merge_responses(responses, query, session)
+
+    def _merge_responses(
+        self,
+        responses: list[AgentResponse],
+        query: str,
+        session: Session,
+    ) -> AgentResponse:
+        """Merge multiple agent responses into a single coherent answer.
+
+        Uses the existing ResponseSynthesizer from teams/ if available,
+        otherwise does a structured concatenation.
+        """
+        total_tokens = sum(r.tokens_used for r in responses)
+        agent_ids = [r.agent_id for r in responses]
+
+        # Try LLM-based synthesis if client is available
+        if self.client:
+            try:
+                # Build synthesis prompt
+                agent_sections = []
+                for r in responses:
+                    agent_name = self._agents[r.agent_id].spec.name if r.agent_id in self._agents else r.agent_id
+                    agent_sections.append(
+                        f"### {agent_name} ({r.agent_id})\n{r.content}"
+                    )
+
+                synthesis_prompt = (
+                    f"The user asked: \"{query}\"\n\n"
+                    f"Multiple specialized agents analyzed different aspects:\n\n"
+                    f"{''.join(agent_sections)}\n\n"
+                    f"Synthesize these into a single, coherent response that:\n"
+                    f"1. Directly answers the user's question\n"
+                    f"2. References specific files and functions from the agents\n"
+                    f"3. Resolves any contradictions\n"
+                    f"4. Identifies gaps if any aspect wasn't covered\n\n"
+                    f"Do NOT just concatenate — produce a unified narrative."
+                )
+
+                synth_response = self.client.messages.create(
+                    model="claude-sonnet-4-20250514",
+                    max_tokens=4096,
+                    system="You are a response synthesizer for a multi-agent code analysis system.",
+                    messages=[{"role": "user", "content": synthesis_prompt}],
+                    temperature=0.3,
+                )
+                synth_tokens = synth_response.usage.input_tokens + synth_response.usage.output_tokens
+                total_tokens += synth_tokens
+
+                return AgentResponse(
+                    content=synth_response.content[0].text,
+                    agent_id=f"multi:{'+'.join(agent_ids)}",
+                    session_id=session.session_id,
+                    tokens_used=total_tokens,
+                    artifacts=[a for r in responses for a in r.artifacts],
+                    metadata={
+                        "multi_agent": True,
+                        "contributing_agents": agent_ids,
+                        "synthesis_tokens": synth_tokens,
+                    },
+                )
+            except Exception:
+                pass  # Fall through to simple merge
+
+        # Simple fallback: structured concatenation
+        parts = []
+        for r in responses:
+            agent_name = self._agents[r.agent_id].spec.name if r.agent_id in self._agents else r.agent_id
+            parts.append(f"**{agent_name}:**\n{r.content}")
+
+        return AgentResponse(
+            content="\n\n---\n\n".join(parts),
+            agent_id=f"multi:{'+'.join(agent_ids)}",
+            session_id=session.session_id,
+            tokens_used=total_tokens,
+            artifacts=[a for r in responses for a in r.artifacts],
+            metadata={
+                "multi_agent": True,
+                "contributing_agents": agent_ids,
+            },
+        )
+
     # ==================== Execution ====================
 
     def run(
@@ -523,6 +812,28 @@ class AgentHub:
                 self._cache_response(cache_key, response)
                 return response
 
+        # Multi-agent routing: if query spans multiple domains but isn't
+        # complex enough for the full DAG team executor, run 2-3 agents
+        # in parallel and merge their responses.
+        if agent_id is None and team_mode != "never":
+            multi_agents = self._route_multi(query)
+            if len(multi_agents) > 1:
+                response = self._run_multi_agent(query, multi_agents, session, model)
+                response = self._handle_followups(response, query, session, model)
+                session.messages.append(
+                    Message(
+                        role="assistant",
+                        content=response.content,
+                        metadata={
+                            "tokens": response.tokens_used,
+                            "agent": response.agent_id,
+                        },
+                    )
+                )
+                session.total_tokens_used += response.tokens_used
+                self._cache_response(cache_key, response)
+                return response
+
         # Route to agent (single agent path) with retry on scope rejection.
         # If the chosen agent rejects the query, try the suggested agent or
         # next-best-scoring agent. Cap at 5 retries to try both tiers.
@@ -571,6 +882,11 @@ class AgentHub:
                 if next_agent_id:
                     target_agent_id = next_agent_id
                     continue  # Retry with the new agent
+
+            # Handle follow-ups: if the agent signals needs_followup with a
+            # suggested agent, hand off automatically instead of just accepting.
+            if response.needs_followup and not response.metadata.get("scope_rejected"):
+                response = self._handle_followups(response, query, session, model)
 
             break  # Accept this response
 

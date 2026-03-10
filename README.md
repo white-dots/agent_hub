@@ -1,227 +1,167 @@
 # AgentHub
 
-**Lightweight agent orchestration for context-efficient LLM applications.**
+**Impact analysis for Claude Code — prevent breaking changes in large repos.**
 
-Stop hitting context limits. Build specialized agents that know their domain.
+When AI edits a file in a large codebase, it doesn't know what depends on that file. A renamed function, a changed signature, or a deleted class silently breaks downstream code. You find out later when tests fail — or worse, in production.
 
-## Quick Start with Claude Code
+AgentHub fixes this. It builds a static import graph of your project and exposes it as MCP tools for Claude Code. Before editing a file, Claude checks its blast radius. After editing, it knows exactly which tests to run. **No LLM calls, no API key, zero token cost.**
 
-AgentHub integrates with Claude Code (terminal or VSCode) to give Claude specialized knowledge about your codebase.
+## What you get
+
+| Tool | When Claude calls it | What it returns |
+|------|---------------------|-----------------|
+| `impact_check` | Before editing a file | Exported interface, dependents (direct + transitive), affected tests, risk level |
+| `affected_tests` | After editing files | Test files to run + suggested pytest/jest command |
+| `codebase_overview` | Orientation | Module count, language breakdown, central modules, project stats |
+
+Plus:
+- **Repo Map** — auto-generated MCP resource injected into every agent's context (including parallel subagents), showing key modules, dependency chains, and editing guidance
+- **Post-edit hooks** — template for running ruff/mypy/tsc after every file edit to catch breakage immediately
+
+## Quick start
 
 ### 1. Install
 
 ```bash
-# Clone the repository
 git clone https://github.com/white-dots/agent_hub
-cd agenthub
-
-# Install with all features
-pip install -e ".[all]"
+cd agent_hub
+pip install -e ".[dev]"
 ```
 
-### 2. Build (one-time setup)
+### 2. Configure Claude Code
 
-```bash
-# Navigate to your project
-cd /path/to/your/project
+Add to your `~/.claude.json`:
 
-# Run build - this will:
-# - Check for API keys (prompts if missing)
-# - Analyze your codebase and create agents
-# - Configure Claude Code's MCP server
-agenthub build .
+```json
+{
+  "mcpServers": {
+    "agenthub": {
+      "command": "python",
+      "args": ["-m", "agenthub.mcp_server", "--project", "/path/to/your/project"],
+      "env": {
+        "PYTHONPATH": "/path/to/agent_hub/src"
+      }
+    }
+  }
+}
 ```
-
-The build command will prompt you for:
-1. **API Key**: Enter your `ANTHROPIC_API_KEY` if not already set
-2. **MCP Setup**: Choose "1" to auto-configure Claude Code
 
 ### 3. Restart Claude Code
 
-After running `agenthub build`, restart Claude Code to load the MCP server.
+The tools are now available. Claude will see `impact_check`, `affected_tests`, and `codebase_overview` in its tool list.
 
-### 4. Use It
-
-Now in Claude Code, you have access to AgentHub tools:
+## Example: impact_check
 
 ```
-# Ask questions about your codebase
-Use agenthub_query to ask: "How does the authentication system work?"
+Impact Analysis: src/models/user.py
+Role: hub | Risk: HIGH
+This is a hub module with 14 transitive dependents. Changes here ripple widely.
 
-# List available agents
-Use agenthub_list_agents to see all specialized agents
+EXPORTED INTERFACE:
+  class User
+    .to_dict()
+    .validate()
+  class UserRole
+  def format_user(user)
+  MAX_USERS
 
-# See routing rules
-Use agenthub_routing_rules to understand how queries are routed
+DIRECT DEPENDENTS (5):
+  src/auth/service.py
+  src/api/routes.py
+  src/api/admin.py
+  src/utils/helpers.py
+  src/workers/sync.py
+
+TRANSITIVE DEPENDENTS (9 additional):
+  src/auth/middleware.py
+  src/api/v2/routes.py
+  ...
+
+AFFECTED TESTS (4):
+  tests/test_auth.py
+  tests/test_api.py
+  tests/test_routes.py
+  tests/test_sync.py
 ```
 
-## CLI Commands
+## Auto-generated repo map
+
+Run `agenthub map /path/to/project` to generate a CLAUDE.md with:
+- Key modules ranked by impact (number of dependents)
+- Dependency chains between hub modules
+- Directory layout with module counts
+- Editing guidance for high-risk files
+
+This content is also served as an MCP resource (`repo://map`) — automatically injected into every Claude Code session, including parallel subagents.
 
 ```bash
-# Build and configure agents (run once per project)
-agenthub build /path/to/project
+# Generate CLAUDE.md in the project root
+agenthub map /path/to/project
 
-# Start the dashboard
-agenthub up
-
-# Start with QC analysis enabled
-agenthub up --qc
-
-# Watch for file changes
-agenthub watch
-
-# Check status
-agenthub status
-
-# Regenerate Tier B agents
-agenthub restructure
+# Print to stdout instead
+agenthub map /path/to/project --stdout
 ```
 
-### Build Options
+## Post-edit hooks
+
+Copy `templates/hooks.json` to your project's `.claude/hooks.json` to run type checkers after every file edit:
+
+- Python files: runs `ruff check` and `mypy`
+- TypeScript files: runs `tsc --noEmit`
+
+This catches interface breakage immediately, before Claude moves on to the next file.
+
+## Benchmark
+
+Tested across synthetic codebases with known dependency structures and breaking mutations:
+
+| Codebase | Modules | Graph build | Impact check (avg) | Blast radius (avg) | Detection |
+|----------|---------|------------|-------------------|--------------------|-----------|
+| Small | 10 | 8ms | 0.2ms | 7 files | 100% |
+| Medium | 50 | 23ms | 0.3ms | 35 files | 100% |
+| Large | 200 | 84ms | 0.4ms | 59 files | 100% |
+
+**66 mutations tested. 100% detection rate. 0% false positives. Sub-millisecond per check.**
+
+> In a 200-module codebase, editing a hub file silently affects 59 downstream files on average. Impact analysis catches 100% of these in under 1ms — with zero LLM cost.
+
+Run the benchmark yourself:
 
 ```bash
-agenthub build /path/to/project [options]
-
-  --auto-mcp      Auto-configure MCP without prompting
-  --skip-mcp      Skip MCP configuration
-  --force         Continue even without API keys
-  --no-tier-a     Skip Tier A (business) agent discovery
-  --no-tier-b     Skip Tier B (code) agent generation
+python benchmarks/bench_impact.py
 ```
 
-## Dashboard
+## How it works
 
-Start the web dashboard to see agents, run queries, and monitor activity:
+AgentHub builds a static import graph by parsing your source files:
+- **Python**: AST parsing (`ast.parse`) for accurate import resolution
+- **TypeScript/JavaScript**: regex-based import/export detection
 
-```bash
-agenthub up --port 3001
-```
+The graph maps every module's imports and importers. When you ask "what breaks if I edit this file?", it walks the `imported_by` edges transitively to find every affected file — including test files.
 
-Then open http://localhost:3001 in your browser.
+No heuristics, no LLM calls, no network requests. Pure static analysis.
 
-## Two-Tier Agent System
+## Supported languages
 
-| Tier | Created By | Purpose |
-|------|-----------|---------|
-| **A: Business** | You (manually) | Domain expertise, APIs, business logic |
-| **B: Code** | AgentHub (auto) | Codebase navigation, file explanations |
-
-Tier A agents are defined in `agents/*.py` files in your project.
-Tier B agents are automatically generated from your codebase structure.
-
-## Configuration
-
-### API Keys
-
-AgentHub needs at least one API key. You can:
-
-1. Let `agenthub build` prompt you (saves to `.env`)
-2. Create a `.env` file manually:
-   ```
-   ANTHROPIC_API_KEY=sk-ant-...
-   ```
-3. Set environment variable:
-   ```bash
-   export ANTHROPIC_API_KEY=sk-ant-...
-   ```
-
-### Config Files
-
-- `~/.agenthub/config.json` - Stores current project path
-- `~/.claude.json` - Claude Code MCP configuration (auto-updated by `agenthub build`)
-
-## Programmatic Usage
-
-### Auto-Agents for Existing Codebases
-
-```python
-from agenthub import AgentHub
-from agenthub.auto import discover_all_agents
-
-# Discover and create all agents
-hub, summary = discover_all_agents("./my-project")
-print(summary)
-
-# Query your codebase
-response = hub.run("How does user authentication work?")
-print(response.content)
-```
-
-### Custom Agents (Tier A)
-
-Create `agents/pricing.py` in your project:
-
-```python
-from agenthub import AgentSpec, BaseAgent
-
-class PricingAgent(BaseAgent):
-    def __init__(self, client):
-        spec = AgentSpec(
-            agent_id="pricing",
-            name="Pricing Expert",
-            description="Knows pricing strategy and margins",
-            context_keywords=["price", "margin", "discount"],
-        )
-        super().__init__(spec, client)
-
-    def build_context(self) -> str:
-        return "... your pricing documentation ..."
-```
-
-## Requirements
-
-- Python 3.11+
-- Anthropic API key (or OpenAI API key)
-
-### Optional Dependencies
-
-```bash
-pip install agenthub[dashboard]  # Dashboard (fastapi, uvicorn)
-pip install agenthub[watch]      # File watching (watchdog)
-pip install agenthub[openai]     # OpenAI support
-pip install agenthub[all]        # Everything
-```
-
-## Troubleshooting
-
-### MCP server not working
-
-1. Make sure you ran `agenthub build` for your project
-2. Restart Claude Code after build
-3. Check `~/.claude.json` has the `agenthub` entry in `mcpServers`
-
-### Agents not found
-
-```bash
-# Check what agents were discovered
-agenthub status
-
-# Rebuild if needed
-agenthub restructure --force
-```
-
-### API key issues
-
-```bash
-# Build will prompt for missing keys
-agenthub build .
-
-# Or set manually
-export ANTHROPIC_API_KEY=your-key-here
-```
+- Python (`.py`) — full AST parsing, `__all__` support
+- TypeScript (`.ts`, `.tsx`) — export detection, interface/type extraction
+- JavaScript (`.js`, `.jsx`) — export detection
 
 ## Development
 
 ```bash
-# Clone and install in dev mode
-git clone https://github.com/white-dots/agent_hub
-cd agenthub
-pip install -e ".[dev,all]"
+pip install -e ".[dev]"
 
-# Run tests
+# Run all tests
 pytest
 
-# Format code
+# Run impact analysis tests only
+pytest tests/test_impact_graph.py tests/test_mcp_server.py tests/test_repo_map.py -v
+
+# Run benchmark
+python benchmarks/bench_impact.py
+
+# Format
 ruff format .
 ruff check .
 ```
