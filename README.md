@@ -111,24 +111,41 @@ Copy `templates/hooks.json` to your project's `.claude/hooks.json` to run type c
 
 This catches interface breakage immediately, before Claude moves on to the next file.
 
-## Benchmark
+## Benchmark: with vs without impact analysis
 
-Tested across synthetic codebases with known dependency structures and breaking mutations:
+We simulated 64 realistic code edits (function renames, signature changes, class renames) across synthetic codebases and measured how many downstream files break silently.
 
-| Codebase | Modules | Graph build | Impact check (avg) | Blast radius (avg) | Detection |
-|----------|---------|------------|-------------------|--------------------|-----------|
-| Small | 10 | 8ms | 0.2ms | 7 files | 100% |
-| Medium | 50 | 23ms | 0.3ms | 35 files | 100% |
-| Large | 200 | 84ms | 0.4ms | 59 files | 100% |
+### Without impact analysis
 
-**66 mutations tested. 100% detection rate. 0% false positives. Sub-millisecond per check.**
+| Codebase | Edits | Edits causing breakage | Files silently broken | Avg broken per edit |
+|----------|-------|----------------------|----------------------|-------------------|
+| Small (10 modules) | 6 | 4 (67%) | 16 | 2.7 |
+| Medium (50 modules) | 15 | 7 (47%) | 87 | 5.8 |
+| Large (200 modules) | 43 | 25 (58%) | 1,199 | 27.9 |
 
-> In a 200-module codebase, editing a hub file silently affects 59 downstream files on average. Impact analysis catches 100% of these in under 1ms — with zero LLM cost.
+### With impact analysis
 
-Run the benchmark yourself:
+| Codebase | Breakage surfaced | Latency (avg) | Latency (p95) |
+|----------|------------------|--------------|--------------|
+| Small (10 modules) | 100% | 0.1ms | 0.2ms |
+| Medium (50 modules) | 100% | 0.2ms | 0.3ms |
+| Large (200 modules) | 100% | 0.3ms | 0.3ms |
+
+**56% of hub file edits silently break downstream code. Impact analysis catches 100% of it — in under 1ms, with zero LLM cost.**
+
+### Performance
+
+| Codebase | Modules | Graph build | Blast radius (avg) | Detection |
+|----------|---------|------------|-------------------|-----------|
+| Small | 10 | 8ms | 7 files | 100% |
+| Medium | 50 | 23ms | 35 files | 100% |
+| Large | 200 | 84ms | 59 files | 100% |
+
+Run the benchmarks yourself:
 
 ```bash
-python benchmarks/bench_impact.py
+python benchmarks/bench_comparative.py  # with vs without comparison
+python benchmarks/bench_impact.py       # detection accuracy & performance
 ```
 
 ## How it works
