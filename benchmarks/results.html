@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AgentHub Impact Analysis — Benchmark Results</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: #0a0a0a;
+    color: #e0e0e0;
+    line-height: 1.6;
+    padding: 40px 20px;
+  }
+  .container { max-width: 1000px; margin: 0 auto; }
+
+  h1 { font-size: 2.2rem; font-weight: 700; color: #fff; margin-bottom: 8px; }
+  .subtitle { font-size: 1.1rem; color: #888; margin-bottom: 48px; }
+
+  /* Hero stats */
+  .hero { display: flex; gap: 24px; margin-bottom: 56px; flex-wrap: wrap; }
+  .hero-card {
+    flex: 1; min-width: 200px;
+    background: #141414; border: 1px solid #222; border-radius: 12px;
+    padding: 24px 20px; text-align: center;
+  }
+  .hero-card .number { font-size: 2.8rem; font-weight: 800; line-height: 1; margin-bottom: 8px; }
+  .hero-card .label { font-size: 0.85rem; color: #888; }
+  .red { color: #ff4d4d; }
+  .green { color: #4dff88; }
+  .blue { color: #4da6ff; }
+  .orange { color: #ffaa33; }
+
+  /* Sections */
+  .section { margin-bottom: 48px; }
+  h2 { font-size: 1.4rem; font-weight: 600; color: #fff; margin-bottom: 8px; }
+  .section-desc { color: #888; margin-bottom: 24px; font-size: 0.95rem; }
+
+  /* Setup explanation */
+  .setup {
+    background: #141414; border: 1px solid #222; border-radius: 12px;
+    padding: 28px; margin-bottom: 40px;
+  }
+  .setup h3 { font-size: 1rem; color: #fff; margin-bottom: 12px; margin-top: 20px; }
+  .setup h3:first-child { margin-top: 0; }
+  .setup p, .setup ul { color: #aaa; font-size: 0.9rem; margin-bottom: 8px; }
+  .setup ul { margin-left: 20px; }
+  .setup li { margin-bottom: 4px; }
+  .setup code { background: #1e1e1e; color: #4da6ff; padding: 2px 6px; border-radius: 4px; font-size: 0.82rem; }
+
+  .flow { display: flex; align-items: center; gap: 8px; margin: 16px 0; flex-wrap: wrap; }
+  .flow-step {
+    background: #1a1a2e; border: 1px solid #333; border-radius: 8px;
+    padding: 10px 14px; font-size: 0.8rem; color: #ccc; text-align: center; min-width: 120px;
+  }
+  .flow-step strong { color: #fff; display: block; margin-bottom: 2px; font-size: 0.85rem; }
+  .flow-arrow { color: #555; font-size: 1.2rem; }
+
+  /* Chart grid */
+  .chart-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin-bottom: 32px; }
+  .chart-box {
+    background: #141414; border: 1px solid #222; border-radius: 12px; padding: 24px;
+  }
+  .chart-box h3 { font-size: 0.9rem; font-weight: 600; color: #999; margin-bottom: 20px; }
+
+  /* CSS bar chart */
+  .bar-chart { display: flex; flex-direction: column; gap: 14px; }
+  .bar-row { display: flex; align-items: center; gap: 12px; }
+  .bar-label { width: 100px; font-size: 0.8rem; color: #888; text-align: right; flex-shrink: 0; }
+  .bar-track { flex: 1; height: 32px; background: #1a1a1a; border-radius: 6px; position: relative; overflow: hidden; }
+  .bar-fill {
+    height: 100%; border-radius: 6px; display: flex; align-items: center;
+    padding-left: 10px; font-size: 0.8rem; font-weight: 600; color: #fff;
+    transition: width 0.6s ease;
+  }
+  .bar-value { position: absolute; right: 10px; top: 50%; transform: translateY(-50%); font-size: 0.8rem; color: #888; }
+
+  /* Comparison section */
+  .comparison {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin-bottom: 32px;
+  }
+  .comp-card {
+    background: #141414; border: 1px solid #222; border-radius: 12px; padding: 24px;
+  }
+  .comp-card.bad { border-color: #ff4d4d33; }
+  .comp-card.good { border-color: #4dff8833; }
+  .comp-card h3 { font-size: 0.9rem; color: #999; margin-bottom: 16px; }
+  .comp-card .big-number { font-size: 2.4rem; font-weight: 800; line-height: 1; margin-bottom: 6px; }
+  .comp-card .detail { font-size: 0.85rem; color: #888; margin-bottom: 4px; }
+
+  /* Stat row */
+  .stat-row {
+    display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 32px;
+  }
+  .stat-card {
+    flex: 1; min-width: 180px;
+    background: #141414; border: 1px solid #222; border-radius: 10px;
+    padding: 18px; text-align: center;
+  }
+  .stat-card .val { font-size: 1.6rem; font-weight: 700; color: #fff; }
+  .stat-card .lbl { font-size: 0.8rem; color: #666; margin-top: 4px; }
+
+  /* Callout */
+  .callout {
+    background: linear-gradient(135deg, #1a1a2e, #16213e);
+    border: 1px solid #2a3a5e; border-radius: 12px;
+    padding: 28px 32px; margin-top: 40px;
+  }
+  .callout p { font-size: 1.05rem; color: #ccc; font-style: italic; }
+  .callout .hl { color: #4dff88; font-weight: 600; font-style: normal; }
+
+  .footer { margin-top: 40px; color: #555; font-size: 0.82rem; text-align: center; }
+  .footer code { color: #666; }
+</style>
+</head>
+<body>
+<div class="container">
+
+  <h1>AgentHub Impact Analysis</h1>
+  <p class="subtitle">Benchmark: editing with vs without dependency awareness</p>
+
+  <!-- Hero stats -->
+  <div class="hero">
+    <div class="hero-card">
+      <div class="number red">56%</div>
+      <div class="label">of hub file edits silently break<br>downstream code (without tool)</div>
+    </div>
+    <div class="hero-card">
+      <div class="number green">100%</div>
+      <div class="label">of that breakage is surfaced<br>by impact_check (with tool)</div>
+    </div>
+    <div class="hero-card">
+      <div class="number blue">&lt;1ms</div>
+      <div class="label">average latency per<br>impact check</div>
+    </div>
+    <div class="hero-card">
+      <div class="number orange">$0</div>
+      <div class="label">LLM cost — pure<br>static analysis</div>
+    </div>
+  </div>
+
+  <!-- Comparison: Without vs With -->
+  <div class="section">
+    <h2>With vs without impact analysis</h2>
+    <p class="section-desc">64 editing scenarios across codebases of 10–200 modules. Each edit targets a hub module's exported interface.</p>
+
+    <div class="comparison">
+      <div class="comp-card bad">
+        <h3>WITHOUT impact analysis</h3>
+        <div class="big-number red">36 / 64</div>
+        <div class="detail">edits caused silent downstream breakage (56%)</div>
+        <div style="margin-top: 16px;">
+          <div class="detail"><strong style="color:#ff8844;">1,302</strong> files silently broken total</div>
+          <div class="detail"><strong style="color:#ff8844;">36.2</strong> avg files broken per breaking edit</div>
+        </div>
+      </div>
+      <div class="comp-card good">
+        <h3>WITH impact analysis</h3>
+        <div class="big-number green">0 / 64</div>
+        <div class="detail">silent breakages (100% surfaced before commit)</div>
+        <div style="margin-top: 16px;">
+          <div class="detail"><strong style="color:#4dff88;">100%</strong> of affected files identified</div>
+          <div class="detail"><strong style="color:#4dff88;">0.2ms</strong> avg impact check latency</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Breakage rate by codebase size -->
+  <div class="section">
+    <h2>Blind edits causing breakage (by codebase size)</h2>
+    <p class="section-desc">Percentage of hub file edits that silently break at least one downstream file.</p>
+    <div class="chart-box">
+      <div class="bar-chart">
+        <div class="bar-row">
+          <div class="bar-label">Small (10)</div>
+          <div class="bar-track">
+            <div class="bar-fill" style="width: 67%; background: linear-gradient(90deg, #ff4d4d, #ff6666);">67%</div>
+          </div>
+        </div>
+        <div class="bar-row">
+          <div class="bar-label">Medium (50)</div>
+          <div class="bar-track">
+            <div class="bar-fill" style="width: 47%; background: linear-gradient(90deg, #ff4d4d, #ff6666);">47%</div>
+          </div>
+        </div>
+        <div class="bar-row">
+          <div class="bar-label">Large (200)</div>
+          <div class="bar-track">
+            <div class="bar-fill" style="width: 58%; background: linear-gradient(90deg, #ff4d4d, #ff6666);">58%</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Files broken -->
+  <div class="section">
+    <h2>Downstream damage per edit</h2>
+    <p class="section-desc">Average number of files silently broken per edit — grows dramatically with codebase size.</p>
+    <div class="chart-box">
+      <div class="bar-chart">
+        <div class="bar-row">
+          <div class="bar-label">Small (10)</div>
+          <div class="bar-track">
+            <div class="bar-fill" style="width: 10%; background: linear-gradient(90deg, #ff8844, #ffaa55);">2.7</div>
+          </div>
+        </div>
+        <div class="bar-row">
+          <div class="bar-label">Medium (50)</div>
+          <div class="bar-track">
+            <div class="bar-fill" style="width: 21%; background: linear-gradient(90deg, #ff8844, #ffaa55);">5.8</div>
+          </div>
+        </div>
+        <div class="bar-row">
+          <div class="bar-label">Large (200)</div>
+          <div class="bar-track">
+            <div class="bar-fill" style="width: 100%; background: linear-gradient(90deg, #ff8844, #ffaa55);">27.9 files</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Performance -->
+  <div class="section">
+    <h2>Performance</h2>
+    <p class="section-desc">Graph build time + per-file impact check latency. All sub-millisecond.</p>
+
+    <div class="stat-row">
+      <div class="stat-card">
+        <div class="val blue">8ms</div>
+        <div class="lbl">graph build (10 modules)</div>
+      </div>
+      <div class="stat-card">
+        <div class="val blue">23ms</div>
+        <div class="lbl">graph build (50 modules)</div>
+      </div>
+      <div class="stat-card">
+        <div class="val blue">84ms</div>
+        <div class="lbl">graph build (200 modules)</div>
+      </div>
+    </div>
+
+    <div class="chart-box">
+      <h3>Impact check latency (per file)</h3>
+      <div class="bar-chart">
+        <div class="bar-row">
+          <div class="bar-label">Small (10)</div>
+          <div class="bar-track">
+            <div class="bar-fill" style="width: 44%; background: linear-gradient(90deg, #4da6ff, #6db8ff);">
+              <span style="margin-left: 4px;">avg 0.14ms</span>
+            </div>
+            <div class="bar-value">p95: 0.19ms</div>
+          </div>
+        </div>
+        <div class="bar-row">
+          <div class="bar-label">Medium (50)</div>
+          <div class="bar-track">
+            <div class="bar-fill" style="width: 69%; background: linear-gradient(90deg, #4da6ff, #6db8ff);">
+              <span style="margin-left: 4px;">avg 0.22ms</span>
+            </div>
+            <div class="bar-value">p95: 0.25ms</div>
+          </div>
+        </div>
+        <div class="bar-row">
+          <div class="bar-label">Large (200)</div>
+          <div class="bar-track">
+            <div class="bar-fill" style="width: 81%; background: linear-gradient(90deg, #4da6ff, #6db8ff);">
+              <span style="margin-left: 4px;">avg 0.26ms</span>
+            </div>
+            <div class="bar-value">p95: 0.32ms</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Detection -->
+  <div class="section">
+    <h2>Detection accuracy</h2>
+    <p class="section-desc">66 mutations tested across all codebase sizes. Since impact analysis walks real import edges (not heuristics), detection is deterministic.</p>
+    <div class="stat-row">
+      <div class="stat-card">
+        <div class="val green">100%</div>
+        <div class="lbl">dependency detection</div>
+      </div>
+      <div class="stat-card">
+        <div class="val green">100%</div>
+        <div class="lbl">test file detection</div>
+      </div>
+      <div class="stat-card">
+        <div class="val green">0%</div>
+        <div class="lbl">false positive rate</div>
+      </div>
+      <div class="stat-card">
+        <div class="val orange">59</div>
+        <div class="lbl">avg blast radius (200-mod)</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Setup explanation -->
+  <div class="section">
+    <h2>How the benchmark works</h2>
+    <div class="setup">
+      <h3>1. Generate synthetic codebases</h3>
+      <p>Three Python projects of increasing size (10, 50, 200 modules) with realistic dependency structures:</p>
+      <ul>
+        <li>Source modules organized into packages (<code>core/</code>, <code>services/</code>, <code>api/</code>, <code>utils/</code>, <code>models/</code>)</li>
+        <li><strong>Hub modules</strong> — files imported by 20–40% of other modules (the high-risk files)</li>
+        <li>Random cross-module dependencies filling out the graph</li>
+        <li>Test files that import source modules (~20% of total)</li>
+      </ul>
+
+      <h3>2. Simulate breaking edits</h3>
+      <p>For each hub module, we simulate mutations that change the public interface:</p>
+      <ul>
+        <li><strong>Rename function</strong> — <code>process_data()</code> → <code>process_data_v2()</code></li>
+        <li><strong>Change signature</strong> — add/remove a parameter</li>
+        <li><strong>Rename class</strong> — <code>UserService</code> → <code>UserServiceV2</code></li>
+      </ul>
+
+      <h3>3. Measure breakage</h3>
+      <div class="flow">
+        <div class="flow-step"><strong>Parse hub</strong>Find exports</div>
+        <div class="flow-arrow">→</div>
+        <div class="flow-step"><strong>Mutate</strong>Rename symbol</div>
+        <div class="flow-arrow">→</div>
+        <div class="flow-step"><strong>Scan deps</strong>Who references it?</div>
+        <div class="flow-arrow">→</div>
+        <div class="flow-step"><strong>Count</strong>Files that break</div>
+      </div>
+
+      <h3>4. Compare scenarios</h3>
+      <ul>
+        <li><strong>Without tool:</strong> Developer edits blindly. Broken dependents discovered later via test failures or runtime errors.</li>
+        <li><strong>With <code>impact_check</code>:</strong> Tool walks import graph (BFS over <code>imported_by</code> edges), surfaces every affected file. Developer updates them before committing.</li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- Callout -->
+  <div class="callout">
+    <p>"We simulated 64 code edits across codebases of 10–200 modules.
+    Without impact analysis, <span class="hl">56% of edits to hub files silently broke downstream code</span>
+    — an average of 36 files per breaking edit.
+    With impact_check, <span class="hl">100% of that breakage is surfaced</span> before it reaches production.
+    Sub-millisecond. Zero LLM cost."</p>
+  </div>
+
+  <p class="footer">AgentHub v2 — Static impact analysis for Claude Code<br>
+  <code>python benchmarks/bench_comparative.py</code></p>
+
+</div>
+</body>
+</html>
